@@ -1,0 +1,243 @@
+VALUE4CARE PIPELINE
+Stato del progetto e piano operativo
+
+---
+
+1. OBIETTIVO GENERALE
+
+---
+
+Costruire una pipeline completamente offline e privacy first per trasformare fascicoli sanitari in event log strutturati utilizzabili per process mining.
+
+Flusso logico finale desiderato:
+
+PDF fascicolo sanitario
+-> estrazione testo
+-> estrazione strutturata tramite LLM locale
+-> validazione backend
+-> salvataggio in database relazionale
+-> generazione event log
+-> process mining
+-> visualizzazione paziente singolo
+-> visualizzazione per malattia o coorte
+
+Vincoli fondamentali:
+
+* Nessuna chiamata esterna consentita
+* LLM esclusivamente locale
+* Separazione netta tra LLM e database
+* Architettura scalabile a milioni di pazienti
+* Privacy massima
+
+Modello target scelto:
+qwen3:30b-a3b tramite Ollama
+
+---
+
+2. COSA E STATO FATTO FINORA
+
+---
+
+Repository e ambiente
+
+* Creato repository GitHub privato
+* Clonato su Kubuntu
+* Creata struttura minima del progetto
+  src
+  data
+  requirements
+* Creato venv Python 3.13
+* Installate dipendenze base
+  fastapi
+  uvicorn
+  requests
+  pydantic
+  pdfplumber
+* Test FastAPI funzionante su localhost
+
+Dati
+
+* Creata cartella data/person001
+* Inseriti circa 15 PDF di un solo paziente
+* Nessuna struttura metadata complessa
+* Nessun database ancora configurato
+
+Ollama
+
+* Installato Ollama su Kubuntu
+* Scaricato modello qwen3:30b-a3b
+* Tentato avvio del modello
+* Errore memoria insufficiente
+
+Errore ricevuto:
+model requires more system memory than is available
+
+Significato:
+Il PC Ubuntu attuale non ha abbastanza RAM disponibile per caricare il modello 30B.
+
+Nota importante:
+Questo NON e un errore di configurazione.
+E un limite reale di memoria disponibile.
+
+---
+
+3. STATO ATTUALE DEL DUBBIO
+
+---
+
+Il modello 30B non puo girare su questo PC Ubuntu.
+
+Esiste un altro PC con 40 GB di RAM.
+
+Decisione architetturale da formalizzare:
+
+Dove deve girare il modello LLM?
+
+Possibili configurazioni:
+
+Opzione A
+LLM gira sul PC con 40 GB
+Sviluppo codice su Kubuntu
+Comunicazione via rete locale
+
+Opzione B
+Tutto gira sulla macchina con 40 GB
+
+Opzione C
+Ridimensionare modello per sviluppo locale
+Usare 30B solo in ambiente produzione
+
+Dubbio aperto principale:
+Quale macchina diventa macchina LLM definitiva?
+
+---
+
+4. PUNTO IN CUI SIAMO TECNICAMENTE
+
+---
+
+Abbiamo:
+
+* Ambiente Python funzionante
+* Server FastAPI funzionante
+* PDF pronti
+* Ollama installato
+* Modello scaricato
+
+Non abbiamo ancora:
+
+* Test reale PDF -> LLM
+* Schema JSON definitivo
+* Database
+* Process mining
+* Visualizzazione
+
+Siamo esattamente prima del primo test reale di estrazione strutturata.
+
+---
+
+5. PROSSIMI PASSI IMMEDIATI
+
+---
+
+Passo 1
+Decidere su quale macchina far girare qwen3:30b-a3b
+
+Passo 2
+Installare Ollama sulla macchina corretta
+
+Passo 3
+Test minimale:
+
+PDF -> estrazione testo con pdfplumber
+-> invio testo a Ollama
+-> ricezione JSON strutturato
+
+Passo 4
+Definire schema JSON minimo:
+
+events
+outcomes
+
+Passo 5
+Scrivere primo parser backend che valida JSON
+
+---
+
+6. PIANO GLOBALE DA COMPLETARE
+
+---
+
+Fase 1
+PDF -> testo nativo
+
+Fase 2
+Test LLM con prompt vincolato a JSON
+
+Fase 3
+Definizione schema database relazionale
+
+Tabelle minime:
+
+patients
+documents
+events
+outcomes
+patient_conditions
+
+Fase 4
+Salvataggio strutturato nel database
+
+Fase 5
+Generazione event log
+
+Fase 6
+Integrazione PM4Py
+Inductive Miner per discovery
+
+Fase 7
+Visualizzazione paziente singolo
+Timeline interattiva
+
+Fase 8
+Visualizzazione per malattia
+Filtro su diagnosi
+Analisi varianti
+
+Fase 9
+Scalabilità
+Separazione macchina LLM
+Separazione macchina DB
+Batch processing
+
+---
+
+7. PRINCIPI ARCHITETTURALI DEFINITIVI
+
+---
+
+* Il LLM non scrive mai nel database
+* Il backend valida sempre il JSON
+* Il testo originale non viene mai modificato
+* Il sistema deve poter cambiare modello senza cambiare schema DB
+* Ogni estrazione deve essere tracciabile
+
+---
+
+8. STATO MENTALE CORRETTO DEL PROGETTO
+
+---
+
+Non siamo in ritardo.
+Non e stato fatto nulla di sbagliato.
+Abbiamo identificato correttamente un vincolo hardware reale prima di costruire sopra di esso.
+
+Il progetto e tecnicamente sano.
+Siamo nel punto corretto del ciclo di progettazione.
+
+---
+
+## FINE STATO PROGETTO
+
+Alla prossima sessione si riparte dal punto:
+Decisione macchina LLM e primo test PDF -> JSON.

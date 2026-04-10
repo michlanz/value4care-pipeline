@@ -1,13 +1,15 @@
 VALUE4CARE PIPELINE
-Stato del progetto e piano operativo
+Stato del progetto e roadmap di tracciabilita
+
+Ultimo aggiornamento: 2026-04-10
 
 ---
 
-1. OBIETTIVO GENERALE
+1. OBIETTIVO DEL PROGETTO
 
 ---
 
-Costruire una pipeline completamente offline e privacy first per trasformare fascicoli sanitari in event log strutturati utilizzabili per process mining.
+Costruire una pipeline completamente offline e privacy first per trasformare fascicoli sanitari in dati strutturati utilizzabili per process mining e analisi cliniche.
 
 Flusso logico finale desiderato:
 
@@ -15,229 +17,249 @@ PDF fascicolo sanitario
 -> estrazione testo
 -> estrazione strutturata tramite LLM locale
 -> validazione backend
--> salvataggio in database relazionale
+-> salvataggio in strutture dati tracciabili
 -> generazione event log
 -> process mining
 -> visualizzazione paziente singolo
--> visualizzazione per malattia o coorte
+-> visualizzazione per coorti o tipologie cliniche
 
 Vincoli fondamentali:
 
 * Nessuna chiamata esterna consentita
 * LLM esclusivamente locale
 * Separazione netta tra LLM e database
-* Architettura scalabile a milioni di pazienti
+* Architettura scalabile a molti pazienti
 * Privacy massima
+* Ogni estrazione deve essere tracciabile
 
-Modello target scelto:
+Modello target attuale:
 qwen3:30b-a3b tramite Ollama
 
 ---
 
-2. COSA E STATO FATTO FINORA
+2. STATO VERIFICATO AD OGGI
 
 ---
 
 Repository e ambiente
 
-* Creato repository GitHub privato
-* Clonato su Kubuntu
-* Creata struttura minima del progetto
-  src
-  data
-  requirements
-* Creato venv Python 3.13
-* Installate dipendenze base
+* Il repository contiene una struttura minima ma funzionante
+* E presente src/main.py con un endpoint FastAPI di health check
+* E presente requirements/requirements-base.txt con le dipendenze base del progetto
+* Le dipendenze base gia registrate includono:
   fastapi
   uvicorn
   requests
   pydantic
   pdfplumber
-* Test FastAPI funzionante su localhost
+* Il test FastAPI base su localhost risulta gia funzionante
 
 Dati
 
-* Creata cartella data/person001
-* Inseriti circa 15 PDF di un solo paziente
-* Nessuna struttura metadata complessa
-* Nessun database ancora configurato
+* La cartella data e la sorgente attiva corretta del dataset di lavoro
+* E presente un dataset iniziale sotto data/raw/person001
+* Il dataset iniziale contiene 10 documenti PDF di un singolo paziente
+* L archivio data.zip resta nel repository come copia di backup del dataset
+* Non e ancora presente un database configurato nel progetto
 
-Ollama
+Ollama e modello
 
-* Installato Ollama su Kubuntu
-* Scaricato modello qwen3:30b-a3b
-* Tentato avvio del modello
-* Errore memoria insufficiente
+* Ollama al momento risulta funzionante solo sul PC Windows con 40 GB di RAM
+* Il tentativo di avvio del modello sul PC Kubuntu originario ha restituito errore di memoria insufficiente
+* L errore osservato non e un problema di configurazione ma un vincolo hardware reale
 
-Errore ricevuto:
-model requires more system memory than is available
+Stato del codice nel repository
 
-Significato:
-Il PC Ubuntu attuale non ha abbastanza RAM disponibile per caricare il modello 30B.
-
-Nota importante:
-Questo NON e un errore di configurazione.
-E un limite reale di memoria disponibile.
+* Il backend applicativo e ancora in fase minima
+* Non esiste ancora una pipeline reale PDF -> LLM -> JSON validato
+* Non esistono ancora schema JSON definitivo, database, process mining o visualizzazioni
 
 ---
 
-3. STATO ATTUALE DEL DUBBIO
+3. DECISIONI ARCHITETTURALI CONSOLIDATE
 
 ---
 
-Il modello 30B non puo girare su questo PC Ubuntu.
+Decisioni di ambiente
 
-Esiste un altro PC con 40 GB di RAM.
+* Il prototipo iniziale verra eseguito sul PC Windows con 40 GB di RAM
+* In questa fase iniziale backend, dataset e LLM possono convivere sulla stessa macchina per ridurre variabili operative
+* La separazione tra macchina LLM e resto della pipeline restera possibile in una fase successiva
 
-Decisione architetturale da formalizzare:
+Decisioni sul ruolo dei componenti
 
-Dove deve girare il modello LLM?
+* Ollama e il runtime del modello locale
+* Il modello LLM viene usato per interpretare semanticamente il contenuto clinico dei documenti
+* pdfplumber viene usato per estrarre testo e struttura base dai PDF testuali
+* pdfplumber non interpreta il significato clinico del documento
+* L interpretazione clinica del contenuto spetta all LLM
+* Il backend resta l unico punto che valida il JSON e decide cosa salvare
+* Il LLM non scrive mai direttamente nel database
+* Il testo originale estratto dai documenti va conservato come evidenza immutabile
+* Eventuali normalizzazioni o riscritture devono vivere solo in campi derivati separati
+* Il sistema deve poter cambiare modello senza cambiare il modello dati principale
 
-Possibili configurazioni:
+Decisioni di ingestione e tracciabilita
 
-Opzione A
-LLM gira sul PC con 40 GB
-Sviluppo codice su Kubuntu
-Comunicazione via rete locale
+* In ingestione iniziale non va fatta dedup distruttiva
+* Per dedup distruttiva si intende che non bisogna unire o cancellare automaticamente documenti o fatti clinici solo perche sembrano simili
+* Documenti diversi possono descrivere lo stesso fatto clinico da prospettive diverse
+* Le evidenze multiple vanno mantenute e tracciate
+* L eventuale fatto clinico canonico verra derivato in un passaggio successivo di riconciliazione
 
-Opzione B
-Tutto gira sulla macchina con 40 GB
+Classificazione documentale gia concordata
 
-Opzione C
-Ridimensionare modello per sviluppo locale
-Usare 30B solo in ambiente produzione
+* CertificatoVaccinale_* -> documento di vaccinazione
+* Riepilogo_* -> documento di sintesi degli eventi, utile ma non autoritativo
+* Documento_sanitario_* -> referto o documento clinico principale
+* Ricetta_* -> prescrizione o ricetta
 
-Dubbio aperto principale:
-Quale macchina diventa macchina LLM definitiva?
+Regole di interpretazione gia concordate
 
----
-
-4. PUNTO IN CUI SIAMO TECNICAMENTE
-
----
-
-Abbiamo:
-
-* Ambiente Python funzionante
-* Server FastAPI funzionante
-* PDF pronti
-* Ollama installato
-* Modello scaricato
-
-Non abbiamo ancora:
-
-* Test reale PDF -> LLM
-* Schema JSON definitivo
-* Database
-* Process mining
-* Visualizzazione
-
-Siamo esattamente prima del primo test reale di estrazione strutturata.
+* Riepilogo_* puo aggiungere contesto ma non sostituisce automaticamente un referto specifico
+* Ricetta_* viene collegata a un referto solo se il contenuto supporta esplicitamente il collegamento
+* I legami clinici non vanno pensati solo come link a coppie tra documenti
+* Serve un contenitore piu ampio che rappresenti il filo clinico di cura
 
 ---
 
-5. PROSSIMI PASSI IMMEDIATI
+4. MODELLO CONCETTUALE DEI DATI
 
 ---
 
-Passo 1
-Decidere su quale macchina far girare qwen3:30b-a3b
+Principio generale
 
-Passo 2
-Installare Ollama sulla macchina corretta
+Il sistema non deve partire da uno schema rigido che pretende di coprire subito ogni famiglia di esami. Deve invece avere:
 
-Passo 3
-Test minimale:
+* un core comune stabile
+* verticali cliniche dedicate quando una famiglia e sufficientemente chiara
+* un event log derivato per il process mining
 
-PDF -> estrazione testo con pdfplumber
--> invio testo a Ollama
--> ricezione JSON strutturato
+Core comune previsto
 
-Passo 4
-Definire schema JSON minimo:
+* patients
+* documents
+* document_artifacts
+* clinical_events
+* document_links
+* care_threads
+* thread_memberships
 
-events
-outcomes
+Significato del care_thread
 
-Passo 5
-Scrivere primo parser backend che valida JSON
+* care_thread e il contenitore concettuale principale per rappresentare un filo clinico
+* puo contenere visite, esami, referti, prescrizioni, terapie e documenti di sintesi
+* puo nascere da un evento acuto, da un disturbo continuativo, da un reperto inatteso o da un percorso amministrativo
+* serve a gestire relazioni molti-a-molti che non si risolvono bene con soli link semplici
 
----
+Verticali cliniche
 
-6. PIANO GLOBALE DA COMPLETARE
+* Verticale v1 esplicitamente prevista: vaccini
+* I certificati vaccinali hanno gia una struttura riconoscibile e sono una prima famiglia adatta a modellazione dedicata
+* Le altre famiglie cliniche verranno specializzate progressivamente osservando documenti reali
 
----
+Strategia per famiglie non ancora modellate
 
-Fase 1
-PDF -> testo nativo
+* Un nuovo tipo di esame non ancora modellato entra comunque nel sistema
+* In prima istanza viene rappresentato come evento generale
+* Il dettaglio strutturato viene mantenuto come JSON grezzo validato e tracciato
+* Solo dopo osservazione di casi reali si decide se introdurre una nuova tabella verticale dedicata
 
-Fase 2
-Test LLM con prompt vincolato a JSON
+Event log
 
-Fase 3
-Definizione schema database relazionale
-
-Tabelle minime:
-
-patients
-documents
-events
-outcomes
-patient_conditions
-
-Fase 4
-Salvataggio strutturato nel database
-
-Fase 5
-Generazione event log
-
-Fase 6
-Integrazione PM4Py
-Inductive Miner per discovery
-
-Fase 7
-Visualizzazione paziente singolo
-Timeline interattiva
-
-Fase 8
-Visualizzazione per malattia
-Filtro su diagnosi
-Analisi varianti
-
-Fase 9
-Scalabilità
-Separazione macchina LLM
-Separazione macchina DB
-Batch processing
+* L event log non e la sorgente primaria di tutti i dati clinici
+* L event log e una proiezione derivata dal core comune e dalle verticali
+* In v1 il log deve essere paziente-centrico
+* La diagnosi e il suo momento temporale vanno trattati come eventi clinici di primo livello
+* Eventi come diagnosi, fratture, infarti, visite, esami e prescrizioni devono poter convivere nello stesso log e negli stessi care_thread
+* I filtri e le aggregazioni potranno poi essere costruiti per care_thread, tipologia clinica o coorte
 
 ---
 
-7. PRINCIPI ARCHITETTURALI DEFINITIVI
+5. ROADMAP OPERATIVA AGGIORNATA
 
 ---
 
-* Il LLM non scrive mai nel database
-* Il backend valida sempre il JSON
-* Il testo originale non viene mai modificato
-* Il sistema deve poter cambiare modello senza cambiare schema DB
-* Ogni estrazione deve essere tracciabile
+Fase 1 - Predisposizione ambiente sul PC 40 GB
+
+* Verificare e stabilizzare il setup Ollama sul PC Windows con 40 GB
+* Verificare che il modello target possa essere effettivamente avviato
+* Preparare ambiente Python e dipendenze del progetto
+* Usare la cartella data come dataset attivo per i test locali
+
+Fase 2 - Primo test end-to-end minimo
+
+* Eseguire un test reale PDF -> testo -> Ollama -> JSON validato
+* Usare come primo caso preferenziale un CertificatoVaccinale_*
+* Verificare che il backend riceva una risposta strutturata e la possa validare
+* Salvare testo estratto e risposta grezza del modello come artefatti tracciabili
+
+Fase 3 - Classificazione documentale iniziale
+
+* Inserire una classificazione preliminare guidata dai filename
+* Gestire almeno queste famiglie:
+  CertificatoVaccinale_*
+  Riepilogo_*
+  Documento_sanitario_*
+  Ricetta_*
+* Usare la classificazione filename come prior forte, lasciando al contenuto la possibilita di correggere casi anomali
+
+Fase 4 - Verticale vaccini
+
+* Definire il primo schema dedicato per i dati vaccinali
+* Estrarre dai CertificatoVaccinale_* le informazioni piu stabili e utili
+* Generare sia il dato verticale vaccini sia gli eventi generali derivati utili al mining
+
+Fase 5 - Introduzione del care_thread
+
+* Introdurre il concetto di care_thread come contenitore di documenti ed eventi correlati
+* Permettere che piu documenti contribuiscano allo stesso filo clinico
+* Mantenere separate le evidenze documentali dal fatto clinico canonico
+
+Fase 6 - Event log paziente-centrico e filtri di analisi
+
+* Costruire un event log centrato sul paziente
+* Associare agli eventi metadati utili per filtri successivi
+* Trattare diagnosi e data della diagnosi come eventi o milestone cliniche di primo livello
+* Consentire in futuro viste aggregate per care_thread, tipologia di esame o coorte clinica
+
+Fase 7 - Specializzazione progressiva di nuove famiglie cliniche
+
+* Osservare i documenti reali non vaccinali
+* Introdurre nuove verticali solo quando la famiglia clinica e abbastanza chiara
+* Esempi possibili in fasi successive:
+  analisi di laboratorio
+  esami strumentali
+  endoscopie
+  visite specialistiche
 
 ---
 
-8. STATO MENTALE CORRETTO DEL PROGETTO
+6. QUESTIONI ANCORA APERTE
 
 ---
 
-Non siamo in ritardo.
-Non e stato fatto nulla di sbagliato.
-Abbiamo identificato correttamente un vincolo hardware reale prima di costruire sopra di esso.
-
-Il progetto e tecnicamente sano.
-Siamo nel punto corretto del ciclo di progettazione.
+* Quando introdurre OCR per i PDF che non contengono testo nativo
+* Come specializzare le famiglie non vaccinali senza frammentare troppo presto il modello dati
+* Quali soglie o regole usare per proporre care_thread candidati quando il collegamento non e esplicito
+* Come definire in modo robusto i criteri di canonizzazione dei fatti clinici a partire da evidenze multiple
 
 ---
 
-## FINE STATO PROGETTO
+7. PUNTO DI RIPARTENZA DELLA PROSSIMA SESSIONE
 
-Alla prossima sessione si riparte dal punto:
-Decisione macchina LLM e primo test PDF -> JSON.
+---
+
+Ripartenza operativa prevista:
+
+* Predisporre il PC con 40 GB come macchina di prototipo
+* Verificare avvio reale del modello target tramite Ollama
+* Usare la cartella data come sorgente dati primaria e mantenere data.zip come backup
+* Eseguire il primo test end-to-end su un documento CertificatoVaccinale_*
+* Verificare che il flusso minimo PDF -> testo -> LLM -> JSON validato funzioni davvero
+
+Nota di stato
+
+Il progetto non e in ritardo.
+Il vincolo hardware e stato individuato correttamente prima di costruire componenti a valle.
+La fase attuale e una fase di consolidamento architetturale e di primo test reale.

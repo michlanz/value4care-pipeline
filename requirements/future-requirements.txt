@@ -1,0 +1,98 @@
+# Future requirements
+#
+# Questo file NON rappresenta l'ambiente attuale del progetto.
+# Serve come promemoria dei pacchetti che probabilmente potranno servire
+# nelle fasi successive.
+#
+# Regola pratica:
+# - quando una fase diventa reale, si prende il pacchetto da qui
+# - si installa nel venv
+# - si verifica che serva davvero
+# - poi si aggiunge a requirements-base.txt con versione congelata
+#
+# Nota:
+# alcuni strumenti importanti non sono pacchetti Python ma programmi di sistema
+# (per esempio Tesseract OCR o Poppler).
+
+
+# --------------------------------------------------
+# PROCESS MINING E ANALISI EVENT LOG
+# --------------------------------------------------
+
+pm4py
+pandas
+
+
+# --------------------------------------------------
+# DATABASE RELAZIONALE E PERSISTENZA
+# --------------------------------------------------
+# sqlite3 non compare qui perché è nella standard library di Python.
+# Questi servono solo se passiamo a una gestione più strutturata o a PostgreSQL.
+
+sqlalchemy
+alembic
+psycopg[binary]
+
+
+# --------------------------------------------------
+# VALIDAZIONE, RETRY E SERIALIZZAZIONE
+# --------------------------------------------------
+# Utili quando inizieremo a fare chiamate reali all'LLM e a validare output JSON.
+
+jsonschema
+tenacity
+orjson
+
+
+# --------------------------------------------------
+# OCR PER PDF NON TESTUALI
+# --------------------------------------------------
+# pytesseract richiede anche Tesseract installato a livello di sistema.
+# pdf2image richiede in genere Poppler a livello di sistema.
+
+pytesseract
+pdf2image
+
+
+# --------------------------------------------------
+# EXPORT E MANIPOLAZIONE DATI
+# --------------------------------------------------
+# Utile se vogliamo esportare facilmente CSV, tabelle intermedie o fare analisi.
+
+openpyxl
+
+
+# --------------------------------------------------
+# API, TEST HTTP E INTEGRAZIONE
+# --------------------------------------------------
+# FastAPI è già nel base. Questi diventano utili quando l'API cresce davvero.
+
+httpx
+
+
+# --------------------------------------------------
+# CONFIGURAZIONE AMBIENTE
+# --------------------------------------------------
+# Utile se iniziamo a usare file .env in modo più esplicito.
+
+python-dotenv
+
+
+# --------------------------------------------------
+# INTERFACCIA INTERATTIVA FUTURA
+# --------------------------------------------------
+# Qui NON conviene installare tutto insieme.
+# Quando decideremo la direzione della UI, sceglieremo UNA strada e solo allora
+# sposteremo i pacchetti nel base requirements.
+
+# Candidati possibili:
+# nicegui
+# streamlit
+# gradio
+
+
+# --------------------------------------------------
+# NOTE FINALI
+# --------------------------------------------------
+# Non tutti i pacchetti qui dentro vanno installati insieme.
+# Questo file è una roadmap tecnica, non un requirements pronto all'uso.

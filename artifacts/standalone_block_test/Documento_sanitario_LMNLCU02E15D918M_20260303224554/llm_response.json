@@ -1,0 +1,8 @@
+{
+  "patient_id": "person001",
+  "document_family": "clinical_document",
+  "diagnosis": {
+    "label": "Frattura del piede",
+    "diagnosed_at": "2026-04-10"
+  }
+}

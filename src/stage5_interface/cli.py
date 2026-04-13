@@ -13,8 +13,8 @@ from typing import Sequence
 
 from clinical import DocumentFamily
 from config import get_config
-from llm_runtime import OllamaClient
-from pdf_reading import classify_document_family, extract_text_from_pdf, list_pdf_files
+from stage2_llm_runtime import OllamaClient
+from stage1_pdf_reading import classify_document_family, extract_text_from_pdf, list_pdf_files
 
 
 def _print_pdf_paths(root: Path, family: DocumentFamily | None = None) -> None:

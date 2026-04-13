@@ -1,7 +1,7 @@
-VALUE4CARE PIPELINE
-Stato del progetto e roadmap di tracciabilita
+﻿VALUE4CARE PIPELINE
+Stato del progetto, decisioni consolidate e prompt operativi
 
-Ultimo aggiornamento: 2026-04-10
+Ultimo aggiornamento: 2026-04-13
 
 ---
 
@@ -15,7 +15,7 @@ Flusso logico finale desiderato:
 
 PDF fascicolo sanitario
 -> estrazione testo
--> estrazione strutturata tramite LLM locale
+-> estrazione strutturata tramite LLM locale o parser deterministico dedicato
 -> validazione backend
 -> salvataggio in strutture dati tracciabili
 -> generazione event log
@@ -31,235 +31,567 @@ Vincoli fondamentali:
 * Architettura scalabile a molti pazienti
 * Privacy massima
 * Ogni estrazione deve essere tracciabile
+* Il testo e il layout originale devono poter essere auditati
 
-Modello target attuale:
-qwen3:30b-a3b tramite Ollama
+Runtime LLM target attuale:
+
+* Ollama locale
+* Modello attualmente configurato: qwen3:30b-a3b
 
 ---
 
-2. STATO VERIFICATO AD OGGI
+2. STATO REALE VERIFICATO AD OGGI
 
 ---
 
 Repository e ambiente
 
-* Il repository contiene una struttura minima ma funzionante
-* E presente src/main.py con un endpoint FastAPI di health check
-* E presente requirements/requirements-base.txt con le dipendenze base del progetto
+* Il repository contiene una struttura modulare minima funzionante
 * Le dipendenze base gia registrate includono:
   fastapi
   uvicorn
   requests
   pydantic
   pdfplumber
-* Il test FastAPI base su localhost risulta gia funzionante
-
-Dati
-
-* La cartella data e la sorgente attiva corretta del dataset di lavoro
-* E presente un dataset iniziale sotto data/raw/person001
-* Il dataset iniziale contiene 10 documenti PDF di un singolo paziente
-* L archivio data.zip resta nel repository come copia di backup del dataset
-* Non e ancora presente un database configurato nel progetto
+* Il backend FastAPI base e caricabile
+* Il dataset di lavoro attivo resta `data/raw/person001`
+* `data.zip` resta una copia di backup
 
 Ollama e modello
 
-* Ollama al momento risulta funzionante solo sul PC Windows con 40 GB di RAM
-* Il tentativo di avvio del modello sul PC Kubuntu originario ha restituito errore di memoria insufficiente
-* L errore osservato non e un problema di configurazione ma un vincolo hardware reale
+* Ollama locale risponde alle health check su `http://127.0.0.1:11434`
+* Il modello `qwen3:30b-a3b` risulta installato
+* La generazione reale via API locale va pero in timeout anche con prompt semplici
+* Il problema attuale non e solo il prompt: il modello, su questa macchina e in questa configurazione, non sta restituendo output in tempi utili allo smoke test
 
-Stato del codice nel repository
+Importante sul significato di `127.0.0.1`
 
-* Il backend applicativo e ancora in fase minima
-* Non esiste ancora una pipeline reale PDF -> LLM -> JSON validato
-* Non esistono ancora schema JSON definitivo, database, process mining o visualizzazioni
+* La chiamata HTTP attuale verso Ollama e comunque locale
+* Non e una chiamata internet o verso un server remoto
+* Si tratta di Python che parla con un servizio locale sulla stessa macchina
+
+Importante sull accesso ai file da parte del modello
+
+* Il modello non puo leggere da solo `reader_text.txt` o altri file del progetto solo perche gli passiamo il path
+* E sempre il codice Python che deve leggere i file e passarne il contenuto al modello
+* Questo resta vero sia con Ollama HTTP sia con un eventuale backend LLM in process
 
 ---
 
-3. DECISIONI ARCHITETTURALI CONSOLIDATE
+3. PRINCIPIO DI LAVORO ATTUALE
 
 ---
 
-Decisioni di ambiente
+Regola operativa concordata
 
-* Il prototipo iniziale verra eseguito sul PC Windows con 40 GB di RAM
-* In questa fase iniziale backend, dataset e LLM possono convivere sulla stessa macchina per ridurre variabili operative
-* La separazione tra macchina LLM e resto della pipeline restera possibile in una fase successiva
+* In questa fase sperimentale si modifica solo `smoke_test_stages_1_to_5.py`
+* I sorgenti sotto `src/` non vanno toccati finche la strategia non e validata
+* Quando una soluzione si dimostra buona nello smoke test, allora si valuta come portarla nei sorgenti veri
 
-Decisioni sul ruolo dei componenti
+Motivazione
 
-* Ollama e il runtime del modello locale
-* Il modello LLM viene usato per interpretare semanticamente il contenuto clinico dei documenti
-* pdfplumber viene usato per estrarre testo e struttura base dai PDF testuali
-* pdfplumber non interpreta il significato clinico del documento
-* L interpretazione clinica del contenuto spetta all LLM
-* Il backend resta l unico punto che valida il JSON e decide cosa salvare
-* Il LLM non scrive mai direttamente nel database
-* Il testo originale estratto dai documenti va conservato come evidenza immutabile
-* Eventuali normalizzazioni o riscritture devono vivere solo in campi derivati separati
-* Il sistema deve poter cambiare modello senza cambiare il modello dati principale
+* Il certificato vaccinale ha un layout a colonne difficile da parsare con testo appiattito
+* Se appiattiamo troppo presto il testo, perdiamo il legame tra dose, data e dettagli sotto colonna
+* Serve quindi una fase sperimentale che lavori prima del flattening definitivo
 
-Decisioni di ingestione e tracciabilita
+Stato del worktree
 
-* In ingestione iniziale non va fatta dedup distruttiva
-* Per dedup distruttiva si intende che non bisogna unire o cancellare automaticamente documenti o fatti clinici solo perche sembrano simili
-* Documenti diversi possono descrivere lo stesso fatto clinico da prospettive diverse
-* Le evidenze multiple vanno mantenute e tracciate
-* L eventuale fatto clinico canonico verra derivato in un passaggio successivo di riconciliazione
+* La modifica di lavoro attuale e concentrata su `smoke_test_stages_1_to_5.py`
+* Gli artefatti generati in `artifacts/...` sono output di test, non modifiche ai sorgenti
 
-Classificazione documentale gia concordata
+---
 
-* CertificatoVaccinale_* -> documento di vaccinazione
-* Riepilogo_* -> documento di sintesi degli eventi, utile ma non autoritativo
-* Documento_sanitario_* -> referto o documento clinico principale
-* Ricetta_* -> prescrizione o ricetta
+4. CLASSIFICAZIONE DOCUMENTALE CONSOLIDATA
+
+---
+
+Classificazione filename gia concordata
+
+* `CertificatoVaccinale_*` -> documento di vaccinazione
+* `Riepilogo_*` -> documento di sintesi degli eventi, utile ma non autoritativo
+* `Documento_sanitario_*` -> referto o documento clinico principale
+* `Ricetta_*` -> prescrizione o ricetta
 
 Regole di interpretazione gia concordate
 
-* Riepilogo_* puo aggiungere contesto ma non sostituisce automaticamente un referto specifico
-* Ricetta_* viene collegata a un referto solo se il contenuto supporta esplicitamente il collegamento
-* I legami clinici non vanno pensati solo come link a coppie tra documenti
-* Serve un contenitore piu ampio che rappresenti il filo clinico di cura
+* `Riepilogo_*` puo aggiungere contesto ma non sostituisce automaticamente un referto specifico
+* `Ricetta_*` viene collegata a un referto solo se il contenuto supporta esplicitamente il collegamento
+* I legami clinici non vanno modellati solo come collegamenti a coppie tra documenti
+* Serve il concetto di `care_thread` come contenitore piu ampio del filo di cura
 
 ---
 
-4. MODELLO CONCETTUALE DEI DATI
+5. STATO SPERIMENTALE DEL CERTIFICATO VACCINALE
 
 ---
 
-Principio generale
+Problema reale osservato
 
-Il sistema non deve partire da uno schema rigido che pretende di coprire subito ogni famiglia di esami. Deve invece avere:
+* Il certificato vaccinale non e disposto come un elenco verticale pulito
+* I vaccini sono stampati in righe con piu colonne orizzontali
+* Le dosi hanno una coppia `numero dose - data`
+* Sotto alcune colonne compaiono dettagli come nome prodotto, quantita e lotto
+* Alcuni dettagli vanno a capo su piu righe
+* Se si usa solo `extract_text()` il risultato perde la geometria del documento
 
-* un core comune stabile
-* verticali cliniche dedicate quando una famiglia e sufficientemente chiara
-* un event log derivato per il process mining
+Esempi concreti gia analizzati
 
-Core comune previsto
+* `MORBILLO`:
+  * dose 2 -> `25/06/2007`
+  * dose 1 -> `08/09/2003`
+  * dettagli osservati sotto la colonna corretta:
+    * `MMR II*SC 1FL + 1SIR.`
+    * `0,5 ML`
+    * `026265013`
 
-* patients
-* documents
-* document_artifacts
-* clinical_events
-* document_links
-* care_threads
-* thread_memberships
+* `POLIOMIELITE IPV`:
+  * dose 3 -> `24/03/2003`
+  * dose 5 -> `18/11/2024`
+  * dose 4 -> `25/10/2004`
+  * dose 2 -> `11/09/2002`
+  * dose 1 -> `24/07/2002`
+  * dettagli correttamente letti nello smoke test:
+    * dose 5 -> `TRIAXIS`, `POLIO*SOSPENSIONE`, `INIETTABILE IN SIRINGA`
+    * dose 4 -> `POLIOVAX-IN*IMSC 1 F`, `1 ML`, `034440014`
 
-Significato del care_thread
+* `COVID 19`:
+  * i dettagli possono ripetersi per piu dosi
+  * questo e stato considerato accettabile dal punto di vista del dominio
 
-* care_thread e il contenitore concettuale principale per rappresentare un filo clinico
-* puo contenere visite, esami, referti, prescrizioni, terapie e documenti di sintesi
-* puo nascere da un evento acuto, da un disturbo continuativo, da un reperto inatteso o da un percorso amministrativo
-* serve a gestire relazioni molti-a-molti che non si risolvono bene con soli link semplici
+Decisione pratica sul problema ambiguita
 
-Verticali cliniche
-
-* Verticale v1 esplicitamente prevista: vaccini
-* I certificati vaccinali hanno gia una struttura riconoscibile e sono una prima famiglia adatta a modellazione dedicata
-* Le altre famiglie cliniche verranno specializzate progressivamente osservando documenti reali
-
-Strategia per famiglie non ancora modellate
-
-* Un nuovo tipo di esame non ancora modellato entra comunque nel sistema
-* In prima istanza viene rappresentato come evento generale
-* Il dettaglio strutturato viene mantenuto come JSON grezzo validato e tracciato
-* Solo dopo osservazione di casi reali si decide se introdurre una nuova tabella verticale dedicata
-
-Event log
-
-* L event log non e la sorgente primaria di tutti i dati clinici
-* L event log e una proiezione derivata dal core comune e dalle verticali
-* In v1 il log deve essere paziente-centrico
-* La diagnosi e il suo momento temporale vanno trattati come eventi clinici di primo livello
-* Eventi come diagnosi, fratture, infarti, visite, esami e prescrizioni devono poter convivere nello stesso log e negli stessi care_thread
-* I filtri e le aggregazioni potranno poi essere costruiti per care_thread, tipologia clinica o coorte
+* I casi inizialmente marcati come ambigui sono stati rivalutati
+* Se il blocco cade chiaramente sotto la riga sopra e una colonna domina nettamente, il parser puo trattarlo come corretto
+* Non va introdotta ambiguita artificiale quando il layout reale suggerisce un associazione forte
 
 ---
 
-5. ROADMAP OPERATIVA AGGIORNATA
+6. COSA FA OGGI LO SMOKE TEST
 
 ---
 
-Fase 1 - Predisposizione ambiente sul PC 40 GB
+File coinvolto
 
-* Verificare e stabilizzare il setup Ollama sul PC Windows con 40 GB
-* Verificare che il modello target possa essere effettivamente avviato
-* Preparare ambiente Python e dipendenze del progetto
-* Usare la cartella data come dataset attivo per i test locali
+* `smoke_test_stages_1_to_5.py`
 
-Fase 2 - Primo test end-to-end minimo
+Comportamento attuale
 
-* Eseguire un test reale PDF -> testo -> Ollama -> JSON validato
-* Usare come primo caso preferenziale un CertificatoVaccinale_*
-* Verificare che il backend riceva una risposta strutturata e la possa validare
-* Salvare testo estratto e risposta grezza del modello come artefatti tracciabili
+* Legge un PDF reale dal dataset
+* Classifica la famiglia documentale
+* Estrae il testo lineare standard con `extract_text_from_pdf`
+* Salva `extracted_text.txt`
+* Se il documento e vaccinale, esegue un reader layout aware locale dentro lo smoke test
+* Raggruppa parole in righe usando le coordinate verticali di `pdfplumber`
+* Raggruppa le parole della riga in blocchi orizzontali
+* Identifica le intestazioni vaccinali con pattern `dose - data`
+* Costruisce zone orizzontali per ciascuna dose
+* Assegna i blocchi di dettaglio alla dose piu plausibile usando le coordinate x
+* Costruisce un `reader` intermedio che conserva i dettagli dose per dose
+* Salva gli artefatti strutturati
+* Costruisce un prompt dedicato ai vaccini
+* Prova poi a chiamare Ollama in locale
 
-Fase 3 - Classificazione documentale iniziale
+Artefatti generati nello smoke test vaccinale
 
-* Inserire una classificazione preliminare guidata dai filename
-* Gestire almeno queste famiglie:
-  CertificatoVaccinale_*
-  Riepilogo_*
-  Documento_sanitario_*
-  Ricetta_*
-* Usare la classificazione filename come prior forte, lasciando al contenuto la possibilita di correggere casi anomali
+* `extracted_text.txt`
+  testo piatto base, utile come controllo rapido
+* `layout_text.txt`
+  vista testuale del layout raggruppato per righe e blocchi
+* `layout_words.json`
+  artefatto tecnico con parole, coordinate, sezioni vaccinali e assegnazioni ai blocchi dose
+* `reader_text.txt`
+  rappresentazione leggibile del reader intermedio, pensata come input migliore per l LLM
+* `reader.json`
+  stessa informazione in forma JSON strutturata
+* `llm_prompt.txt`
+  prompt effettivamente passato o preparato per il modello
+* `llm_response.json`
+  risposta grezza e parsata del modello, quando disponibile
 
-Fase 4 - Verticale vaccini
+Percorso artefatti di test attuale
 
-* Definire il primo schema dedicato per i dati vaccinali
-* Estrarre dai CertificatoVaccinale_* le informazioni piu stabili e utili
-* Generare sia il dato verticale vaccini sia gli eventi generali derivati utili al mining
+* `artifacts/pipeline_reale/CertificatoVaccinale_LMNLCU02E15D918M_20260303104746/`
 
-Fase 5 - Introduzione del care_thread
+Stato di esecuzione attuale
 
-* Introdurre il concetto di care_thread come contenitore di documenti ed eventi correlati
-* Permettere che piu documenti contribuiscano allo stesso filo clinico
-* Mantenere separate le evidenze documentali dal fatto clinico canonico
-
-Fase 6 - Event log paziente-centrico e filtri di analisi
-
-* Costruire un event log centrato sul paziente
-* Associare agli eventi metadati utili per filtri successivi
-* Trattare diagnosi e data della diagnosi come eventi o milestone cliniche di primo livello
-* Consentire in futuro viste aggregate per care_thread, tipologia di esame o coorte clinica
-
-Fase 7 - Specializzazione progressiva di nuove famiglie cliniche
-
-* Osservare i documenti reali non vaccinali
-* Introdurre nuove verticali solo quando la famiglia clinica e abbastanza chiara
-* Esempi possibili in fasi successive:
-  analisi di laboratorio
-  esami strumentali
-  endoscopie
-  visite specialistiche
+* Blocco 1 funziona e salva gli artefatti
+* Il reader vaccinale sperimentale e attivo nello smoke test
+* Il blocco LLM si ferma per timeout del modello locale
 
 ---
 
-6. QUESTIONI ANCORA APERTE
+7. READER VACCINALE: SIGNIFICATO DEGLI ARTEFATTI
 
 ---
 
-* Quando introdurre OCR per i PDF che non contengono testo nativo
-* Come specializzare le famiglie non vaccinali senza frammentare troppo presto il modello dati
-* Quali soglie o regole usare per proporre care_thread candidati quando il collegamento non e esplicito
-* Come definire in modo robusto i criteri di canonizzazione dei fatti clinici a partire da evidenze multiple
+`extracted_text.txt`
+
+* Serve solo per vedere il testo piatto estratto dal PDF
+* Non e sufficiente per il parsing corretto dei vaccini
+
+`layout_text.txt`
+
+* Serve come vista umana piu leggibile del layout
+* Non e la sorgente di verita per l estrazione clinica
+* Da solo non basta per capire sempre a quale dose appartenga un dettaglio
+
+`layout_words.json`
+
+* E la sorgente tecnica piu importante del reader
+* Conserva posizione e blocchi dei contenuti
+* Permette di capire a quale colonna appartengono i dettagli
+* E il punto giusto dove intervenire quando il layout viene caratterizzato male
+
+`reader_text.txt`
+
+* E un artefatto intermedio pensato per dare al modello un input piu pulito del testo piatto
+* Non e il JSON clinico finale
+
+`reader.json`
+
+* E la versione strutturata del reader intermedio
+* E utile sia per debug sia come possibile base di un builder deterministico del JSON clinico vaccinale
 
 ---
 
-7. PUNTO DI RIPARTENZA DELLA PROSSIMA SESSIONE
+8. DECISIONE STRUTTURALE SUI VACCINI
 
 ---
 
-Ripartenza operativa prevista:
+Decisione emersa durante il lavoro
 
-* Predisporre il PC con 40 GB come macchina di prototipo
-* Verificare avvio reale del modello target tramite Ollama
-* Usare la cartella data come sorgente dati primaria e mantenere data.zip come backup
-* Eseguire il primo test end-to-end su un documento CertificatoVaccinale_*
-* Verificare che il flusso minimo PDF -> testo -> LLM -> JSON validato funzioni davvero
+* Per i documenti vaccinali non e obbligatorio usare l LLM per costruire il JSON clinico finale
+* Se il reader layout aware estrae gia bene dose, data e dettagli, ha senso costruire il JSON in modo deterministico
+* Questa strada puo restare concettualmente nel blocco 2 della pipeline, ma come branch dedicato ai vaccini
 
-Nota di stato
+Forma architetturale desiderata
 
-Il progetto non e in ritardo.
-Il vincolo hardware e stato individuato correttamente prima di costruire componenti a valle.
-La fase attuale e una fase di consolidamento architetturale e di primo test reale.
+* `stage1`:
+  lettura PDF e reader layout aware vaccinale
+* `stage2`:
+  * per vaccini -> builder deterministico `reader -> clinical JSON`
+  * per altri documenti -> branch LLM tradizionale
+* `stage3`:
+  salvataggio su database e artefatti
+* `stage4`:
+  derivazione eventi per process mining
+
+Vantaggio
+
+* Evitiamo di chiedere al modello di reinterpretare qualcosa che il parser ha gia capito bene
+* Manteniamo comunque la stessa forma finale di output verso database e mining
+
+---
+
+9. PROPOSTA DI JSON FINALE PER IL DATABASE
+
+---
+
+Principio
+
+* Il database deve ricevere fatti clinici normalizzati
+* Il layout grezzo deve restare negli artefatti, non come dato clinico primario
+* Ogni dose vaccinale deve poter diventare anche un evento clinico derivato
+
+Shape proposto del JSON finale vaccinale
+
+```json
+{
+  "document": {
+    "source_document": "string",
+    "document_family": "vaccination_certificate",
+    "patient_id": "string or null",
+    "parser": "vaccination_reader_v1",
+    "parser_version": "string"
+  },
+  "vaccinations": [
+    {
+      "source_vaccine_label": "MORBILLO",
+      "normalized_vaccine_key": "morbillo",
+      "dose_number": 2,
+      "administration_date": "2007-06-25",
+      "product_name": "MMR II*SC 1FL + 1SIR.",
+      "dose_amount_text": "0,5 ML",
+      "lot_code": "026265013",
+      "confidence": "high",
+      "evidence_type": "exact",
+      "ambiguity_notes": [],
+      "source_detail_texts": [
+        "MMR II*SC 1FL + 1SIR.",
+        "0,5 ML",
+        "026265013"
+      ]
+    }
+  ],
+  "clinical_events": [
+    {
+      "event_type": "vaccination",
+      "activity_label": "Vaccination - MORBILLO",
+      "occurred_at": "2007-06-25",
+      "source_vaccine_label": "MORBILLO",
+      "normalized_vaccine_key": "morbillo",
+      "dose_number": 2,
+      "confidence": "high",
+      "source_document": "string"
+    }
+  ]
+}
+```
+
+Campi ritenuti importanti
+
+* `source_vaccine_label`
+  nome come appare nel certificato
+* `normalized_vaccine_key`
+  chiave stabile per query e aggregazioni
+* `dose_number`
+  attributo esplicito, non nascosto nei tag
+* `administration_date`
+  data clinica della dose
+* `product_name`, `dose_amount_text`, `lot_code`
+  dettagli amministrativi o farmaceutici recuperati quando disponibili
+* `confidence`
+  qualita della lettura
+* `evidence_type`
+  `exact | ambiguous | missing`
+* `source_detail_texts`
+  audit rapido dei dettagli usati
+
+---
+
+10. PROPOSTA DI DATABASE
+
+---
+
+Tabelle core confermate o desiderate
+
+* `patients`
+* `documents`
+* `document_artifacts`
+* `clinical_events`
+* `document_links`
+* `care_threads`
+* `thread_memberships`
+
+Verticale vaccini proposta
+
+* `vaccinations`
+
+Campi suggeriti per `documents`
+
+* `document_id`
+* `patient_id`
+* `source_path`
+* `document_family`
+* `parser`
+* `parser_version`
+
+Campi suggeriti per `document_artifacts`
+
+* `document_id`
+* `extracted_text_path`
+* `layout_text_path`
+* `layout_words_path`
+* `reader_json_path`
+* eventuale `llm_prompt_path`
+* eventuale `llm_response_path`
+
+Campi suggeriti per `vaccinations`
+
+* `vaccination_id`
+* `document_id`
+* `patient_id`
+* `source_vaccine_label`
+* `normalized_vaccine_key`
+* `dose_number`
+* `administration_date`
+* `product_name`
+* `dose_amount_text`
+* `lot_code`
+* `confidence`
+* `evidence_type`
+* `ambiguity_notes_json`
+* `source_detail_texts_json`
+
+Campi suggeriti per `clinical_events`
+
+* `event_id`
+* `patient_id`
+* `document_id`
+* `event_type`
+* `activity_label`
+* `occurred_at`
+* `source_table`
+* `source_row_id`
+* `confidence`
+* `tags_json`
+
+Decisione per il process mining
+
+* Meglio usare `activity_label = Vaccination - {vaccine}`
+* `dose_number` deve restare un attributo separato
+* In questo modo non esplodono inutilmente le attivita distinte nel log
+
+Cosa NON va messo come dato clinico primario nel database
+
+* `layout_words.json`
+* `layout_text.txt`
+* testo del prompt LLM come fatto clinico
+* risposta raw del modello come fatto clinico
+
+Questi elementi vanno tenuti come artefatti tracciabili, collegati tramite path o metadati
+
+---
+
+11. STATO DEL PROMPT LLM
+
+---
+
+Situazione attuale
+
+* Esiste gia nello smoke test un prompt dedicato al certificato vaccinale
+* Il prompt usa `reader_text.txt` come input, non il testo piatto
+* Il prompt chiede al modello di produrre un JSON con una riga per dose
+* A oggi non abbiamo ancora potuto valutarne bene la qualita pratica perche il modello locale va in timeout
+
+Decisione importante
+
+* Il prompt resta utile per prove future
+* Tuttavia, per i vaccini, la strada preferita e sempre di piu il builder deterministico del JSON finale
+* L LLM resta comunque utile come confronto, fallback o validazione sperimentale
+
+---
+
+12. PROMPT OPERATIVI PER LE PROSSIME SESSIONI
+
+---
+
+A. Prompt per riprendere il lavoro con Codex sullo smoke test
+
+```text
+Riprendiamo il lavoro sul progetto value4care-pipeline.
+Leggi prima statolavori.txt e poi controlla lo stato reale di smoke_test_stages_1_to_5.py.
+In questa fase voglio modificare solo lo smoke test e non i sorgenti sotto src/.
+Obiettivo della sessione: continuare il branch vaccini partendo dal reader layout-aware gia costruito.
+Prima spiegami in modo sintetico dove siamo arrivati, poi implementa il prossimo passo concordato.
+```
+
+B. Prompt per lavorare sul builder deterministico vaccini
+
+```text
+Lavora solo su smoke_test_stages_1_to_5.py.
+Parti dal reader vaccinale gia esistente e costruisci il JSON clinico finale per il database senza usare l LLM.
+Mantieni tracciabilita tra source_document, vaccinations e clinical_events.
+Non toccare i sorgenti sotto src/ finche non validiamo il risultato.
+Alla fine mostra un esempio reale dell output sul certificato vaccinale di test.
+```
+
+C. Prompt per discutere e rifinire lo schema database
+
+```text
+Leggi statolavori.txt e allineati allo schema vaccini gia proposto.
+Voglio discutere i campi finali del JSON clinico e delle tabelle database per supportare bene il process mining.
+Concentrati su vaccinations, documents, document_artifacts e clinical_events.
+Evidenzia solo i campi davvero utili e segnala quelli ridondanti o deboli.
+```
+
+D. Prompt per quando sara il momento di portare la logica nei sorgenti veri
+
+```text
+Abbiamo validato il branch vaccini nello smoke test.
+Ora sposta nei sorgenti del progetto solo la logica che si e dimostrata stabile.
+Mantieni una specializzazione esplicita per vaccination_certificate.
+Aggiorna stage1 e stage2 in modo coerente con quanto documentato in statolavori.txt.
+Prima riassumi cosa stai portando in src e cosa invece resta solo come supporto di test.
+```
+
+E. Prompt utente per chiedere a Codex un controllo di coerenza prima di procedere
+
+```text
+Leggi statolavori.txt, confrontalo con smoke_test_stages_1_to_5.py e dimmi se il codice implementa davvero le decisioni documentate.
+Voglio una review tecnica: findings prima, poi eventuali rischi e infine un riassunto breve.
+```
+
+---
+
+13. TEMPLATE PROMPT LLM PER I VACCINI
+
+---
+
+Questo e il template concettuale da tenere per prove future sul modello. Va usato passando il contenuto del reader, non solo il path del file.
+
+```text
+You are extracting structured vaccination records from a layout-aware reader.
+Return only valid JSON.
+Never invent information.
+If evidence is weak or ambiguous, keep uncertain fields null and explain ambiguity in notes.
+
+Return one JSON object with this shape:
+{
+  "document_type": "vaccination_certificate",
+  "source_document": "...",
+  "vaccinations": [
+    {
+      "vaccine": "string",
+      "dose_number": 1,
+      "administration_date": "YYYY-MM-DD",
+      "product_name": null,
+      "dose_amount_text": null,
+      "lot_code": null,
+      "confidence": "high|medium|low",
+      "evidence_type": "exact|ambiguous|missing",
+      "ambiguity_notes": []
+    }
+  ]
+}
+
+Rules:
+- Create one item for each dose that has a date.
+- Use the vaccine name from the current VACCINE section.
+- Convert dates from DD/MM/YYYY or DD-MM-YYYY to YYYY-MM-DD.
+- Use exact details as the strongest evidence.
+- If only ambiguous details exist, do not guess unsupported fields.
+- If a dose exists but no reliable details are attached, still include it with null detail fields.
+- Do not invent product names, lot codes, dose amounts, or routes.
+
+Reader input:
+[INCOLLARE QUI reader_text.txt]
+```
+
+Nota pratica
+
+* Se si usa ancora l LLM, il prompt va costruito dal contenuto del reader
+* Non basta dire al modello di leggere un file locale dal suo path
+
+---
+
+14. QUESTIONI APERTE
+
+---
+
+* Verificare se conviene davvero mantenere il branch LLM per i vaccini oppure passare direttamente a builder deterministico
+* Rifinire eventuali normalizzazioni dei nomi vaccino in `normalized_vaccine_key`
+* Stabilire eventuali regole su lotti, formati dose e date incomplete
+* Decidere quando introdurre OCR per PDF non testuali
+* Definire i criteri di passaggio da smoke test a sorgenti `src/`
+* Valutare se testare il prompt LLM con un modello locale piu leggero o con timeout piu gestibili
+
+---
+
+15. PUNTO DI RIPARTENZA CONSIGLIATO
+
+---
+
+Se la prossima sessione vuole massimizzare avanzamento pratico, il passo migliore e:
+
+1. Restare nello smoke test
+2. Implementare il builder deterministico `reader -> JSON clinico vaccinale`
+3. Salvare anche l output finale come artefatto dedicato
+4. Verificare che da quel JSON sia immediato derivare le righe di `vaccinations` e `clinical_events`
+5. Solo dopo questa validazione, valutare se portare la logica in `src/`
+
+In alternativa, se si vuole ancora testare l LLM:
+
+1. Usare il `reader_text.txt` come input
+2. Ridurre la dimensione del prompt o il numero di vaccini passati per prova
+3. Considerare un modello locale piu leggero se `qwen3:30b-a3b` continua a non rispondere in tempi utili

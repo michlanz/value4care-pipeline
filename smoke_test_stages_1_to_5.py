@@ -231,13 +231,8 @@ def _classify_block_to_doses(
 
     if len(overlapping) == 1:
         chosen = overlapping[0]
-        edge_distance = min(
-            abs(block_left - float(chosen["zone_left"])),
-            abs(block_right - float(chosen["zone_right"])),
-        )
-        assignment_mode = "ambiguous_edge" if edge_distance <= ZONE_EDGE_TOLERANCE else "exact"
         return {
-            "assignment_mode": assignment_mode,
+            "assignment_mode": "exact",
             "assigned_dose_header": chosen["header_text"],
             "assigned_dose_number": chosen["dose_number"],
             "assigned_dose_date": chosen["date"],
@@ -246,6 +241,20 @@ def _classify_block_to_doses(
 
     if len(overlapping) > 1:
         chosen = overlapping[0]
+        secondary = overlapping[1]
+        if (
+            float(chosen["overlap_ratio"]) >= 0.9
+            and float(secondary["overlap_ratio"]) <= 0.1
+            and float(chosen["center_distance"]) < float(secondary["center_distance"])
+        ):
+            return {
+                "assignment_mode": "exact",
+                "assigned_dose_header": chosen["header_text"],
+                "assigned_dose_number": chosen["dose_number"],
+                "assigned_dose_date": chosen["date"],
+                "candidate_doses": overlapping,
+            }
+
         return {
             "assignment_mode": "ambiguous_multi_column",
             "assigned_dose_header": chosen["header_text"],

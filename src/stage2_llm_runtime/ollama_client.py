@@ -49,6 +49,7 @@ class OllamaClient:
         payload: dict[str, Any] = {
             "model": self.model,
             "prompt": prompt,
+            #"think": False, # Test Luca
             "stream": False,
         }
         if system:

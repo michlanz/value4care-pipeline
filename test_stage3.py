@@ -1,7 +1,11 @@
-﻿"""Runner standalone per testare lo stage 3 della pipeline Value4Care.
+"""Runner standalone per testare il database vaccini della pipeline Value4Care.
 
-Questo file prende l'output di stage1 e lo salva in un database SQLite locale,
-per ora con focus sul caso vaccini senza passare dall'LLM.
+Questo file prende l'output di test_stage1.py e lo salva in due database SQLite
+separati dentro `aggregated database/`:
+- vaccini.sqlite
+- anagrafiche_pazienti.sqlite
+
+Per ora non crea nessun database aggregato e non passa dall'LLM.
 """
 
 from __future__ import annotations
@@ -10,12 +14,10 @@ import argparse
 import json
 import re
 import sqlite3
-import sys
 from pathlib import Path
 from typing import Any
 
 ROOT_DIR = Path(__file__).resolve().parent
-
 DEFAULT_INTERPRETED_JSON = (
     ROOT_DIR
     / "artifacts"
@@ -23,10 +25,15 @@ DEFAULT_INTERPRETED_JSON = (
     / "CertificatoVaccinale_LMNLCU02E15D918M_20260303104746"
     / "interpreted_text.json"
 )
+DEFAULT_DB_DIR = ROOT_DIR / "aggregated database"
+DEFAULT_ARTIFACTS_ROOT = ROOT_DIR / "artifacts"
+VACCINATION_DIR_GLOB = "CertificatoVaccinale*"
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Test standalone di stage 3 su database SQLite.")
+    parser = argparse.ArgumentParser(
+        description="Test standalone del database vaccini senza usare l'LLM."
+    )
     parser.add_argument(
         "--interpreted-json",
         type=Path,
@@ -34,10 +41,31 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path a interpreted_text.json prodotto da test_stage1.py",
     )
     parser.add_argument(
-        "--db-path",
+        "--person",
+        type=str,
+        help="Importa solo i certificati vaccinali di una persona, cercando gli artifacts stage1 sotto artifacts/<person>/.",
+    )
+    parser.add_argument(
+        "--vaccini-all",
+        action="store_true",
+        help="Cicla su tutti gli artifacts vaccinali disponibili sotto artifacts/person*/CertificatoVaccinale*/.",
+    )
+    parser.add_argument(
+        "--artifacts-root",
         type=Path,
-        default=None,
-        help="Path finale del database SQLite. Se omesso usa artifacts/<person>/<person>_stage3.sqlite",
+        default=DEFAULT_ARTIFACTS_ROOT,
+        help="Root degli artifacts stage1 organizzati per persona.",
+    )
+    parser.add_argument(
+        "--db-dir",
+        type=Path,
+        default=DEFAULT_DB_DIR,
+        help="Cartella in cui creare vaccini.sqlite e anagrafiche_pazienti.sqlite",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Reimporta un documento anche se nel database risultano gia righe con la stessa origine documento.",
     )
     return parser
 
@@ -46,7 +74,27 @@ def _load_interpreted_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _resolve_patient_id(interpreted_json_path: Path, payload: dict[str, Any]) -> str:
+def _find_vaccination_artifacts_for_person(person_dir: Path) -> list[Path]:
+    return sorted(
+        path / "interpreted_text.json"
+        for path in person_dir.glob(VACCINATION_DIR_GLOB)
+        if path.is_dir() and (path / "interpreted_text.json").exists()
+    )
+
+
+def _discover_vaccination_artifacts(artifacts_root: Path) -> tuple[list[Path], list[str]]:
+    interpreted_paths: list[Path] = []
+    warnings: list[str] = []
+    for person_dir in sorted(path for path in artifacts_root.iterdir() if path.is_dir() and path.name.startswith("person")):
+        matches = _find_vaccination_artifacts_for_person(person_dir)
+        if matches:
+            interpreted_paths.extend(matches)
+        else:
+            warnings.append(f"{person_dir.name}: nessun artifact vaccinale stage1 trovato")
+    return interpreted_paths, warnings
+
+
+def _resolve_patient_code(interpreted_json_path: Path, payload: dict[str, Any]) -> str:
     parent_name = interpreted_json_path.parent.parent.name if interpreted_json_path.parent.parent else ""
     if parent_name.startswith("person"):
         return parent_name
@@ -54,21 +102,6 @@ def _resolve_patient_id(interpreted_json_path: Path, payload: dict[str, Any]) ->
     if tax_code:
         return tax_code.lower()
     return "patient_unknown"
-
-
-def _resolve_db_path(interpreted_json_path: Path, payload: dict[str, Any], override: Path | None) -> Path:
-    if override is not None:
-        return override.resolve()
-    patient_id = _resolve_patient_id(interpreted_json_path, payload)
-    return ROOT_DIR / "artifacts" / patient_id / f"{patient_id}_stage3.sqlite"
-
-
-def _normalize_vaccine_key(label: str) -> str:
-    normalized = label.lower().strip()
-    normalized = normalized.replace("*", " ")
-    normalized = re.sub(r"[^a-z0-9]+", "_", normalized)
-    normalized = re.sub(r"_+", "_", normalized).strip("_")
-    return normalized
 
 
 def _normalize_date(raw: str | None) -> str | None:
@@ -85,353 +118,347 @@ def _normalize_date(raw: str | None) -> str | None:
     return f"{year}-{month}-{day}"
 
 
-def _classify_vaccination_details(exact_detail_texts: list[str], ambiguous_detail_blocks: list[dict[str, Any]]) -> dict[str, Any]:
-    evidence_type = "missing"
-    if exact_detail_texts:
-        evidence_type = "exact"
-    elif ambiguous_detail_blocks:
-        evidence_type = "ambiguous"
-
-    amount_pattern = re.compile(r"\b\d+[\.,]?\d*\s*ML\b", re.IGNORECASE)
-    code_pattern = re.compile(r"\b\d{6,}\b")
-
-    dose_amount_text = None
-    lot_code = None
-    product_parts: list[str] = []
-
+def _flatten_note_text(exact_detail_texts: list[str], ambiguous_detail_blocks: list[dict[str, Any]]) -> str | None:
+    parts: list[str] = []
     for item in exact_detail_texts:
-        if dose_amount_text is None and amount_pattern.search(item):
-            dose_amount_text = item
+        cleaned = str(item).strip()
+        if cleaned:
+            parts.append(cleaned)
+    for block in ambiguous_detail_blocks:
+        cleaned = str(block.get("text", "")).strip()
+        if cleaned:
+            parts.append(cleaned)
+    if not parts:
+        return None
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        key = part.casefold()
+        if key in seen:
             continue
-        if lot_code is None and code_pattern.search(item):
-            lot_code = code_pattern.search(item).group(0)
-            continue
-        product_parts.append(item)
-
-    product_name = " ".join(product_parts).strip() or None
-    ambiguity_notes = [block.get("text") for block in ambiguous_detail_blocks if block.get("text")]
-
-    return {
-        "product_name": product_name,
-        "dose_amount_text": dose_amount_text,
-        "lot_code": lot_code,
-        "evidence_type": evidence_type,
-        "ambiguity_notes": ambiguity_notes,
-        "source_detail_texts": exact_detail_texts,
-    }
+        seen.add(key)
+        deduped.append(part)
+    return " | ".join(deduped)
 
 
-def _build_vaccination_rows(payload: dict[str, Any], interpreted_json_path: Path) -> list[dict[str, Any]]:
-    patient_id = _resolve_patient_id(interpreted_json_path, payload)
+def _build_vaccini_rows(payload: dict[str, Any], interpreted_json_path: Path) -> list[dict[str, Any]]:
+    codice_persona = _resolve_patient_code(interpreted_json_path, payload)
     document = payload.get("document", {})
     reader = payload.get("specialized", {}).get("vaccination_reader", {})
+    origine_documento = document.get("source_path")
+    document_id = document.get("document_id") or interpreted_json_path.parent.name
     rows: list[dict[str, Any]] = []
 
     for vaccine in reader.get("vaccines", []):
-        vaccine_label = vaccine.get("vaccine_label") or "unknown_vaccine"
-        vaccine_key = _normalize_vaccine_key(vaccine_label)
+        vaccine_label = (vaccine.get("vaccine_label") or "vaccino_sconosciuto").strip()
         for dose in vaccine.get("doses", []):
-            details = _classify_vaccination_details(
-                dose.get("exact_detail_texts", []),
-                dose.get("ambiguous_detail_blocks", []),
-            )
-            dose_number = int(dose.get("dose_number")) if dose.get("dose_number") else None
+            dose_number_raw = dose.get("dose_number")
+            dose_number = int(dose_number_raw) if dose_number_raw else None
             administration_date = _normalize_date(dose.get("date"))
-            vaccination_id = f"{document.get('source_path')}::{vaccine_key}::{dose_number}::{administration_date}"
             rows.append(
                 {
-                    "vaccination_id": vaccination_id,
-                    "document_id": document.get("source_path"),
-                    "patient_id": patient_id,
-                    "source_vaccine_label": vaccine_label,
-                    "normalized_vaccine_key": vaccine_key,
-                    "dose_number": dose_number,
-                    "administration_date": administration_date,
-                    "product_name": details["product_name"],
-                    "dose_amount_text": details["dose_amount_text"],
-                    "lot_code": details["lot_code"],
-                    "confidence": dose.get("confidence"),
-                    "evidence_type": details["evidence_type"],
-                    "ambiguity_notes_json": json.dumps(details["ambiguity_notes"], ensure_ascii=False),
-                    "source_detail_texts_json": json.dumps(details["source_detail_texts"], ensure_ascii=False),
+                    "codice_persona": codice_persona,
+                    "data": administration_date,
+                    "tipo_documento": "riepilogo vaccinale",
+                    "tipo_evento": "vaccino",
+                    "sottotipo_evento": vaccine_label,
+                    "specifiche_sottotipo_evento": dose_number,
+                    "sessione_id": f"{codice_persona}::{administration_date}" if administration_date else None,
+                    "care_thread": "vaccinazioni",
+                    "ente_erogatore": "",
+                    "note": _flatten_note_text(
+                        dose.get("exact_detail_texts", []),
+                        dose.get("ambiguous_detail_blocks", []),
+                    ),
+                    "origine_documento": origine_documento,
+                    "document_id": document_id,
                 }
             )
     return rows
 
 
-def _build_clinical_event_rows(vaccination_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    events: list[dict[str, Any]] = []
-    for row in vaccination_rows:
-        event_id = f"event::{row['vaccination_id']}"
-        events.append(
-            {
-                "event_id": event_id,
-                "patient_id": row["patient_id"],
-                "document_id": row["document_id"],
-                "event_type": "vaccination",
-                "activity_label": f"Vaccination - {row['source_vaccine_label']}",
-                "occurred_at": row["administration_date"],
-                "source_table": "vaccinations",
-                "source_row_id": row["vaccination_id"],
-                "confidence": row["confidence"],
-                "tags_json": json.dumps(
-                    [
-                        "vaccination",
-                        row["normalized_vaccine_key"],
-                        f"dose:{row['dose_number']}",
-                    ],
-                    ensure_ascii=False,
-                ),
-            }
-        )
-    return events
-
-
-def _init_db(conn: sqlite3.Connection) -> None:
-    conn.executescript(
-        """
-        PRAGMA foreign_keys = ON;
-
-        CREATE TABLE IF NOT EXISTS patients (
-            patient_id TEXT PRIMARY KEY,
-            full_name TEXT,
-            given_name TEXT,
-            family_name TEXT,
-            tax_code TEXT,
-            birth_date TEXT,
-            birth_place TEXT,
-            residence_city TEXT,
-            address_or_residence TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS documents (
-            document_id TEXT PRIMARY KEY,
-            patient_id TEXT NOT NULL,
-            source_path TEXT NOT NULL,
-            document_family TEXT,
-            document_subcategory TEXT,
-            issuing_organization TEXT,
-            document_snapshot_date TEXT,
-            parser TEXT,
-            parser_version TEXT,
-            FOREIGN KEY(patient_id) REFERENCES patients(patient_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS document_artifacts (
-            document_id TEXT PRIMARY KEY,
-            extracted_text_path TEXT,
-            interpreted_text_path TEXT,
-            interpreted_json_path TEXT,
-            prompt_main_path TEXT,
-            layout_text_path TEXT,
-            layout_words_path TEXT,
-            reader_text_path TEXT,
-            reader_json_path TEXT,
-            FOREIGN KEY(document_id) REFERENCES documents(document_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS vaccinations (
-            vaccination_id TEXT PRIMARY KEY,
-            document_id TEXT NOT NULL,
-            patient_id TEXT NOT NULL,
-            source_vaccine_label TEXT,
-            normalized_vaccine_key TEXT,
-            dose_number INTEGER,
-            administration_date TEXT,
-            product_name TEXT,
-            dose_amount_text TEXT,
-            lot_code TEXT,
-            confidence TEXT,
-            evidence_type TEXT,
-            ambiguity_notes_json TEXT,
-            source_detail_texts_json TEXT,
-            FOREIGN KEY(document_id) REFERENCES documents(document_id),
-            FOREIGN KEY(patient_id) REFERENCES patients(patient_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS clinical_events (
-            event_id TEXT PRIMARY KEY,
-            patient_id TEXT NOT NULL,
-            document_id TEXT NOT NULL,
-            event_type TEXT,
-            activity_label TEXT,
-            occurred_at TEXT,
-            source_table TEXT,
-            source_row_id TEXT,
-            confidence TEXT,
-            tags_json TEXT,
-            FOREIGN KEY(document_id) REFERENCES documents(document_id),
-            FOREIGN KEY(patient_id) REFERENCES patients(patient_id)
-        );
-        """
-    )
-
-
-def _insert_patient(conn: sqlite3.Connection, patient_id: str, payload: dict[str, Any]) -> None:
+def _build_anagrafica_row(payload: dict[str, Any], interpreted_json_path: Path) -> dict[str, Any]:
     patient = payload.get("patient", {})
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO patients (
-            patient_id, full_name, given_name, family_name, tax_code, birth_date,
-            birth_place, residence_city, address_or_residence
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            patient_id,
-            patient.get("full_name"),
-            patient.get("given_name"),
-            patient.get("family_name"),
-            patient.get("tax_code"),
-            patient.get("birth_date"),
-            patient.get("birth_place"),
-            patient.get("residence_city"),
-            patient.get("address_or_residence"),
-        ),
-    )
-
-
-def _insert_document(conn: sqlite3.Connection, patient_id: str, payload: dict[str, Any]) -> str:
     document = payload.get("document", {})
-    document_id = document.get("source_path")
+    return {
+        "codice_paziente": _resolve_patient_code(interpreted_json_path, payload),
+        "nome": patient.get("given_name"),
+        "cognome": patient.get("family_name"),
+        "nome_completo": patient.get("full_name"),
+        "codice_fiscale": patient.get("tax_code"),
+        "data_nascita": patient.get("birth_date"),
+        "luogo_nascita": patient.get("birth_place"),
+        "citta_residenza": patient.get("residence_city"),
+        "indirizzo_residenza": patient.get("address_or_residence"),
+        "data_rilevamento": document.get("document_snapshot_date"),
+    }
+
+
+def _init_vaccini_db(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
-        INSERT OR REPLACE INTO documents (
-            document_id, patient_id, source_path, document_family, document_subcategory,
-            issuing_organization, document_snapshot_date, parser, parser_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            document_id,
-            patient_id,
-            document.get("source_path"),
-            document.get("document_family"),
-            document.get("document_subcategory"),
-            document.get("issuing_organization"),
-            document.get("document_snapshot_date"),
-            "vaccination_reader_v1",
-            "test_stage3_v1",
-        ),
+        CREATE TABLE IF NOT EXISTS vaccini (
+            codice_persona TEXT NOT NULL,
+            data TEXT,
+            tipo_documento TEXT NOT NULL,
+            tipo_evento TEXT NOT NULL,
+            sottotipo_evento TEXT,
+            specifiche_sottotipo_evento INTEGER,
+            sessione_id TEXT,
+            care_thread TEXT NOT NULL,
+            ente_erogatore TEXT,
+            note TEXT,
+            origine_documento TEXT NOT NULL,
+            document_id TEXT,
+            UNIQUE (codice_persona, data, sottotipo_evento, specifiche_sottotipo_evento, origine_documento)
+        )
+        """
     )
-    return document_id
-
-
-def _insert_artifacts(conn: sqlite3.Connection, document_id: str, interpreted_json_path: Path) -> None:
-    document_dir = interpreted_json_path.parent
-    def maybe(name: str) -> str | None:
-        path = document_dir / name
-        return str(path) if path.exists() else None
+    columns = {
+        row_info[1]
+        for row_info in conn.execute("PRAGMA table_info(vaccini)").fetchall()
+    }
+    if "sessione_id" not in columns:
+        conn.execute("ALTER TABLE vaccini ADD COLUMN sessione_id TEXT")
+    if "document_id" not in columns:
+        conn.execute("ALTER TABLE vaccini ADD COLUMN document_id TEXT")
 
     conn.execute(
         """
-        INSERT OR REPLACE INTO document_artifacts (
-            document_id, extracted_text_path, interpreted_text_path, interpreted_json_path,
-            prompt_main_path, layout_text_path, layout_words_path, reader_text_path, reader_json_path
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            document_id,
-            maybe("extracted_text.txt"),
-            maybe("interpreted_text.txt"),
-            str(interpreted_json_path),
-            maybe("prompt_main.txt"),
-            maybe("layout_text.txt"),
-            maybe("layout_words.json"),
-            maybe("reader_text.txt"),
-            maybe("reader.json"),
-        ),
+        CREATE TABLE IF NOT EXISTS documenti_importati (
+            document_id TEXT PRIMARY KEY,
+            codice_persona TEXT NOT NULL,
+            source_document TEXT NOT NULL,
+            artifact_path TEXT NOT NULL,
+            imported_at TEXT NOT NULL
+        )
+        """
     )
 
 
-def _insert_vaccinations(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> None:
+def _init_anagrafiche_db(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS anagrafiche_pazienti (
+            codice_paziente TEXT NOT NULL,
+            nome TEXT,
+            cognome TEXT,
+            nome_completo TEXT,
+            codice_fiscale TEXT,
+            data_nascita TEXT,
+            luogo_nascita TEXT,
+            citta_residenza TEXT,
+            indirizzo_residenza TEXT,
+            data_rilevamento TEXT NOT NULL,
+            UNIQUE (codice_paziente, codice_fiscale, data_rilevamento)
+        )
+        """
+    )
+
+
+def _insert_vaccini_rows(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> None:
     conn.executemany(
         """
-        INSERT OR REPLACE INTO vaccinations (
-            vaccination_id, document_id, patient_id, source_vaccine_label, normalized_vaccine_key,
-            dose_number, administration_date, product_name, dose_amount_text, lot_code,
-            confidence, evidence_type, ambiguity_notes_json, source_detail_texts_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT OR REPLACE INTO vaccini (
+            codice_persona, data, tipo_documento, tipo_evento, sottotipo_evento,
+            specifiche_sottotipo_evento, sessione_id, care_thread, ente_erogatore, note, origine_documento, document_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
-                row["vaccination_id"],
+                row["codice_persona"],
+                row["data"],
+                row["tipo_documento"],
+                row["tipo_evento"],
+                row["sottotipo_evento"],
+                row["specifiche_sottotipo_evento"],
+                row["sessione_id"],
+                row["care_thread"],
+                row["ente_erogatore"],
+                row["note"],
+                row["origine_documento"],
                 row["document_id"],
-                row["patient_id"],
-                row["source_vaccine_label"],
-                row["normalized_vaccine_key"],
-                row["dose_number"],
-                row["administration_date"],
-                row["product_name"],
-                row["dose_amount_text"],
-                row["lot_code"],
-                row["confidence"],
-                row["evidence_type"],
-                row["ambiguity_notes_json"],
-                row["source_detail_texts_json"],
             )
             for row in rows
         ],
     )
 
 
-def _insert_events(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> None:
-    conn.executemany(
+def _insert_anagrafica_row(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
+    conn.execute(
         """
-        INSERT OR REPLACE INTO clinical_events (
-            event_id, patient_id, document_id, event_type, activity_label, occurred_at,
-            source_table, source_row_id, confidence, tags_json
+        INSERT OR REPLACE INTO anagrafiche_pazienti (
+            codice_paziente, nome, cognome, nome_completo, codice_fiscale,
+            data_nascita, luogo_nascita, citta_residenza, indirizzo_residenza, data_rilevamento
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        [
-            (
-                row["event_id"],
-                row["patient_id"],
-                row["document_id"],
-                row["event_type"],
-                row["activity_label"],
-                row["occurred_at"],
-                row["source_table"],
-                row["source_row_id"],
-                row["confidence"],
-                row["tags_json"],
-            )
-            for row in rows
-        ],
+        (
+            row["codice_paziente"],
+            row["nome"],
+            row["cognome"],
+            row["nome_completo"],
+            row["codice_fiscale"],
+            row["data_nascita"],
+            row["luogo_nascita"],
+            row["citta_residenza"],
+            row["indirizzo_residenza"],
+            row["data_rilevamento"],
+        ),
     )
+
+
+def _document_already_imported(conn: sqlite3.Connection, document_id: str | None) -> bool:
+    if not document_id:
+        return False
+    row = conn.execute(
+        "SELECT 1 FROM documenti_importati WHERE document_id = ? LIMIT 1",
+        (document_id,),
+    ).fetchone()
+    return row is not None
+
+
+def _register_imported_document(
+    conn: sqlite3.Connection,
+    document_id: str,
+    codice_persona: str,
+    source_document: str,
+    artifact_path: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO documenti_importati (
+            document_id, codice_persona, source_document, artifact_path, imported_at
+        ) VALUES (?, ?, ?, ?, datetime('now'))
+        """,
+        (document_id, codice_persona, source_document, artifact_path),
+    )
+
+
+def _resolve_requested_interpreted_jsons(args: argparse.Namespace) -> tuple[list[Path], list[str]]:
+    artifacts_root = args.artifacts_root.resolve()
+    warnings: list[str] = []
+
+    if args.vaccini_all or not args.person:
+        if not artifacts_root.exists():
+            return [], [f"root artifacts non trovata: {artifacts_root}"]
+        return _discover_vaccination_artifacts(artifacts_root)
+
+    person_dir = artifacts_root / args.person
+    if not person_dir.exists():
+        return [], [f"cartella artifacts non trovata: {person_dir}"]
+    matches = _find_vaccination_artifacts_for_person(person_dir)
+    if not matches:
+        return [], [f"{args.person}: nessun artifact vaccinale stage1 trovato"]
+    return matches, warnings
+
+
+def _import_single_payload(
+    interpreted_json_path: Path,
+    vaccini_conn: sqlite3.Connection,
+    anagrafiche_conn: sqlite3.Connection,
+    force: bool,
+) -> tuple[str, str, int, bool]:
+    payload = _load_interpreted_json(interpreted_json_path)
+    vaccini_rows = _build_vaccini_rows(payload, interpreted_json_path)
+    anagrafica_row = _build_anagrafica_row(payload, interpreted_json_path)
+    document = payload.get("document", {})
+    document_id = document.get("document_id") or interpreted_json_path.parent.name
+    source_document = vaccini_rows[0]["origine_documento"] if vaccini_rows else document.get("source_path")
+
+    if not force and _document_already_imported(vaccini_conn, document_id):
+        return anagrafica_row["codice_paziente"], document_id, 0, True
+
+    _insert_vaccini_rows(vaccini_conn, vaccini_rows)
+    _insert_anagrafica_row(anagrafiche_conn, anagrafica_row)
+    _register_imported_document(
+        vaccini_conn,
+        document_id,
+        anagrafica_row["codice_paziente"],
+        source_document or "unknown_source_document",
+        str(interpreted_json_path),
+    )
+    return anagrafica_row["codice_paziente"], document_id, len(vaccini_rows), False
 
 
 def main() -> int:
     args = _build_parser().parse_args()
-    interpreted_json_path = args.interpreted_json.resolve()
-    if not interpreted_json_path.exists():
-        print(f"ERRORE: file non trovato: {interpreted_json_path}")
+    interpreted_json_paths, warnings = _resolve_requested_interpreted_jsons(args)
+
+    for warning in warnings:
+        print(f"ATTENZIONE: {warning}")
+
+    if not interpreted_json_paths:
+        print("ERRORE: nessun artifact vaccinale da importare.")
         return 1
 
-    payload = _load_interpreted_json(interpreted_json_path)
-    patient_id = _resolve_patient_id(interpreted_json_path, payload)
-    db_path = _resolve_db_path(interpreted_json_path, payload, args.db_path)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_dir = args.db_dir.resolve()
+    db_dir.mkdir(parents=True, exist_ok=True)
 
-    vaccination_rows = _build_vaccination_rows(payload, interpreted_json_path)
-    event_rows = _build_clinical_event_rows(vaccination_rows)
+    vaccini_db_path = db_dir / "vaccini.sqlite"
+    anagrafiche_db_path = db_dir / "anagrafiche_pazienti.sqlite"
 
-    conn = sqlite3.connect(db_path)
+    vaccini_conn = sqlite3.connect(vaccini_db_path, timeout=30)
+    anagrafiche_conn = sqlite3.connect(anagrafiche_db_path, timeout=30)
     try:
-        _init_db(conn)
-        _insert_patient(conn, patient_id, payload)
-        document_id = _insert_document(conn, patient_id, payload)
-        _insert_artifacts(conn, document_id, interpreted_json_path)
-        _insert_vaccinations(conn, vaccination_rows)
-        _insert_events(conn, event_rows)
-        conn.commit()
-    finally:
-        conn.close()
+        vaccini_conn.execute("PRAGMA journal_mode = WAL")
+        anagrafiche_conn.execute("PRAGMA journal_mode = WAL")
+        vaccini_conn.execute("PRAGMA busy_timeout = 30000")
+        anagrafiche_conn.execute("PRAGMA busy_timeout = 30000")
+        _init_vaccini_db(vaccini_conn)
+        _init_anagrafiche_db(anagrafiche_conn)
 
-    print("=== TEST STAGE 3 ===")
-    print(f"-> interpreted json: {interpreted_json_path}")
-    print(f"-> db sqlite: {db_path}")
-    print(f"-> patient_id: {patient_id}")
-    print(f"-> vaccinations inserted: {len(vaccination_rows)}")
-    print(f"-> clinical events inserted: {len(event_rows)}")
+        total_rows = 0
+        imported_documents = 0
+        skipped_documents = 0
+        if not args.person:
+            print("-> Comportamento di default: scansione di tutti gli artifacts vaccinali stage1.")
+
+        for index, interpreted_json_path in enumerate(interpreted_json_paths, start=1):
+            if len(interpreted_json_paths) > 1:
+                print(f"\n##### IMPORT DATABASE VACCINI {index}/{len(interpreted_json_paths)} #####")
+                print(f"-> Artifact: {interpreted_json_path}")
+            elif args.person:
+                print(f"-> Persona richiesta: {args.person}")
+
+            if not interpreted_json_path.exists():
+                print(f"ERRORE: file non trovato: {interpreted_json_path}")
+                continue
+
+            codice_persona, document_id, written_rows, skipped = _import_single_payload(
+                interpreted_json_path,
+                vaccini_conn,
+                anagrafiche_conn,
+                args.force,
+            )
+            if skipped:
+                skipped_documents += 1
+                print("-> Documento gia presente nel database, salto l'import per evitare passaggi inutili.")
+                print(f"-> Codice persona: {codice_persona}")
+                print(f"-> Document id: {document_id}")
+                continue
+
+            imported_documents += 1
+            total_rows += written_rows
+            print(f"-> Codice persona: {codice_persona}")
+            print(f"-> Document id: {document_id}")
+            print(f"-> Righe vaccini scritte: {written_rows}")
+            print("-> Riga anagrafica scritta: 1")
+
+        vaccini_conn.commit()
+        anagrafiche_conn.commit()
+    finally:
+        vaccini_conn.close()
+        anagrafiche_conn.close()
+
+    print("\n=== TEST DATABASE VACCINI ===")
+    print(f"-> cartella database: {db_dir}")
+    print(f"-> vaccini sqlite: {vaccini_db_path}")
+    print(f"-> anagrafiche sqlite: {anagrafiche_db_path}")
+    print(f"-> documenti importati: {imported_documents}")
+    print(f"-> documenti saltati: {skipped_documents}")
+    print(f"-> righe vaccini scritte in questo run: {total_rows}")
+    print("-> aggregato non creato in questa fase.")
     return 0
 
 

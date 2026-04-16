@@ -19,8 +19,6 @@
 # PROCESS MINING E ANALISI EVENT LOG
 # --------------------------------------------------
 
-pm4py
-pandas
 
 
 # --------------------------------------------------
@@ -68,14 +66,6 @@ openpyxl
 # FastAPI è già nel base. Questi diventano utili quando l'API cresce davvero.
 
 httpx
-
-
-# --------------------------------------------------
-# CONFIGURAZIONE AMBIENTE
-# --------------------------------------------------
-# Utile se iniziamo a usare file .env in modo più esplicito.
-
-python-dotenv
 
 
 # --------------------------------------------------

@@ -38,7 +38,9 @@ DEFAULT_PDF = (
     / "person001"
     / "CertificatoVaccinale_LMNLCU02E15D918M_20260303104746.pdf"
 )
+DEFAULT_RAW_ROOT = ROOT_DIR / "data" / "raw"
 DEFAULT_ARTIFACTS_ROOT = ROOT_DIR / "artifacts"
+VACCINATION_GLOB = "CertificatoVaccinale*.pdf"
 DATE_RE = re.compile(r"\b\d{2}[/-]\d{2}[/-]\d{2,4}\b")
 TAX_CODE_RE = re.compile(r"\b[A-Z]{6}\d{2}[A-Z]\d{2}[A-Z]\d{3}[A-Z]\b")
 UPPER_NAME_RE = re.compile(r"^[A-Z' ]{3,}$")
@@ -76,15 +78,42 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Test standalone di stage 1.")
     parser.add_argument("--pdf", type=Path, default=DEFAULT_PDF, help="PDF da processare.")
     parser.add_argument(
+        "--person",
+        type=str,
+        help=(
+            "Processa il vaccino di una persona cercando automaticamente "
+            "l'unico file che inizia con 'CertificatoVaccinale' nella cartella data/raw/<person>/."
+        ),
+    )
+    parser.add_argument(
+        "--vaccini-all",
+        action="store_true",
+        help=(
+            "Cicla su tutte le cartelle person* sotto data/raw e cerca in ciascuna "
+            "l'unico CertificatoVaccinale*.pdf."
+        ),
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Abilita artefatti di debug aggiuntivi anche per documenti non vaccinali.",
+    )
+    parser.add_argument(
+        "--raw-root",
+        type=Path,
+        default=DEFAULT_RAW_ROOT,
+        help="Root dei documenti grezzi organizzati per persona.",
     )
     parser.add_argument(
         "--artifacts-root",
         type=Path,
         default=DEFAULT_ARTIFACTS_ROOT,
         help="Directory root degli artefatti per paziente/documento.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Riesegue stage1 anche se gli artefatti standard esistono gia.",
     )
     return parser
 
@@ -107,6 +136,41 @@ def _resolve_document_artifact_dir(pdf_path: Path, artifacts_root: Path) -> Path
     person_id = pdf_path.parent.name if pdf_path.parent.name.startswith("person") else "person_unknown"
     document_id = pdf_path.stem
     return artifacts_root / person_id / document_id
+
+
+def _find_unique_vaccination_pdf(person_dir: Path) -> Path | None:
+    matches = sorted(path for path in person_dir.glob(VACCINATION_GLOB) if path.is_file())
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _discover_vaccination_pdfs(raw_root: Path) -> tuple[list[Path], list[str]]:
+    pdfs: list[Path] = []
+    warnings: list[str] = []
+    for person_dir in sorted(path for path in raw_root.iterdir() if path.is_dir() and path.name.startswith("person")):
+        matches = sorted(path for path in person_dir.glob(VACCINATION_GLOB) if path.is_file())
+        if len(matches) == 1:
+            pdfs.append(matches[0])
+            continue
+        if not matches:
+            warnings.append(f"{person_dir.name}: nessun {VACCINATION_GLOB} trovato")
+        else:
+            warnings.append(
+                f"{person_dir.name}: trovati {len(matches)} file {VACCINATION_GLOB}, serve un solo certificato vaccinale"
+            )
+    return pdfs, warnings
+
+
+def _has_stage1_outputs(document_root: Path) -> bool:
+    standard_paths = _artifact_paths(document_root)
+    required = (
+        standard_paths["extracted_text"],
+        standard_paths["interpreted_text"],
+        standard_paths["interpreted_json"],
+        standard_paths["prompt_main"],
+    )
+    return all(path.exists() for path in required)
 
 
 def _extract_filename_snapshot_date(pdf_path: Path) -> str | None:
@@ -216,6 +280,15 @@ def _render_line_from_blocks(blocks: list[dict[str, Any]]) -> str:
     return "\t".join(block["text"] for block in blocks if block["text"]).strip()
 
 
+def _dose_sort_key(dose_column: dict[str, Any]) -> tuple[int, str, float]:
+    raw_dose = str(dose_column.get("dose_number") or "")
+    try:
+        dose_number = int(raw_dose)
+    except ValueError:
+        dose_number = 9999
+    return (dose_number, str(dose_column.get("date") or ""), float(dose_column.get("center_x") or 0.0))
+
+
 def _build_dose_zones(dose_columns: list[dict[str, Any]]) -> list[dict[str, Any]]:
     sorted_columns = sorted(dose_columns, key=lambda column: float(column["center_x"]))
     for index, column in enumerate(sorted_columns):
@@ -235,10 +308,116 @@ def _build_dose_zones(dose_columns: list[dict[str, Any]]) -> list[dict[str, Any]
         column["zone_right"] = round(right_boundary, 1)
     return sorted_columns
 
+
+def _extract_dose_columns_from_line(line: dict[str, Any]) -> list[dict[str, Any]]:
+    dose_columns: list[dict[str, Any]] = []
+    for block in line["blocks"]:
+        block_text = str(block["text"])
+        matches = list(DOSE_DATE_RE.finditer(block_text))
+        for match in matches:
+            dose_columns.append(
+                {
+                    "header_text": match.group(0),
+                    "dose_number": match.group("dose"),
+                    "date": match.group("date"),
+                    "x0": block["x0"],
+                    "x1": block["x1"],
+                    "center_x": block["center_x"],
+                }
+            )
+    return dose_columns
+
+
+def _is_dose_only_header_line(line: dict[str, Any]) -> bool:
+    if not line.get("blocks"):
+        return False
+    has_dose = False
+    for block in line["blocks"]:
+        block_text = str(block["text"]).strip()
+        if not block_text:
+            continue
+        full_matches = list(DOSE_DATE_RE.finditer(block_text))
+        if not full_matches:
+            return False
+        rebuilt = " ".join(match.group(0) for match in full_matches).strip()
+        normalized = re.sub(r"\s+", " ", block_text)
+        if rebuilt != normalized:
+            return False
+        has_dose = True
+    return has_dose
+
+
+def _merge_section_dose_columns(current_section: dict[str, Any], new_columns: list[dict[str, Any]]) -> None:
+    existing = list(current_section.get("dose_columns", []))
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for column in existing + new_columns:
+        key = (str(column.get("dose_number") or ""), str(column.get("date") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(column)
+    current_section["dose_columns"] = _build_dose_zones(merged)
+
+
+def _is_label_only_header_line(line: dict[str, Any], current_section: dict[str, Any]) -> bool:
+    blocks = line.get("blocks") or []
+    if len(blocks) != 1:
+        return False
+
+    normalized = re.sub(r"\s+", " ", str(line.get("text") or "").strip())
+    if not normalized:
+        return False
+    if DOSE_DATE_RE.search(normalized) or any(char.isdigit() for char in normalized):
+        return False
+    if normalized != normalized.upper():
+        return False
+
+    tokens = normalized.split()
+    if len(tokens) < 2 or len(tokens) > 4:
+        return False
+
+    forbidden_fragments = (
+        "*",
+        "+",
+        "ML",
+        "SIR",
+        "FL",
+        "AGHI",
+        "INIETT",
+        "CONC",
+        "DOSI",
+        "SOLVENTE",
+        "POLVERE",
+        "VACCINE",
+        "COVID",
+    )
+    if any(fragment in normalized for fragment in forbidden_fragments):
+        return False
+
+    dose_columns = current_section.get("dose_columns", [])
+    if not dose_columns:
+        return False
+
+    leftmost_zone = min(float(column.get("zone_left", column.get("x0", 0.0))) for column in dose_columns)
+    block = blocks[0]
+    block_right = float(block.get("x1", 0.0))
+    return block_right <= leftmost_zone - 8.0
+
+
+def _append_label_continuation(current_section: dict[str, Any], line_text: str) -> None:
+    normalized = re.sub(r"\s+", " ", line_text.strip())
+    if not normalized:
+        return
+    current_section.setdefault("label_continuation_lines", []).append(normalized)
+    base_label = str(current_section.get("vaccine_label") or "").strip()
+    current_section["vaccine_label"] = f"{base_label} {normalized}".strip()
+
+
 def _parse_vaccine_header(line: dict[str, Any]) -> dict[str, Any] | None:
     vaccine_label_parts: list[str] = []
-    dose_columns: list[dict[str, Any]] = []
     seen_first_dose = False
+    dose_columns = _extract_dose_columns_from_line(line)
 
     for block in line["blocks"]:
         block_text = str(block["text"])
@@ -253,17 +432,6 @@ def _parse_vaccine_header(line: dict[str, Any]) -> dict[str, Any] | None:
             vaccine_label_parts.append(prefix)
 
         seen_first_dose = True
-        for match in matches:
-            dose_columns.append(
-                {
-                    "header_text": match.group(0),
-                    "dose_number": match.group("dose"),
-                    "date": match.group("date"),
-                    "x0": block["x0"],
-                    "x1": block["x1"],
-                    "center_x": block["center_x"],
-                }
-            )
 
     vaccine_label = " ".join(part for part in vaccine_label_parts if part).strip(" -")
     if vaccine_label and dose_columns:
@@ -364,6 +532,8 @@ def _extract_vaccine_sections(lines: list[dict[str, Any]]) -> list[dict[str, Any
             current_section = {
                 "vaccine_label": header["vaccine_label"],
                 "header_line_text": line_text,
+                "header_continuation_lines": [],
+                "label_continuation_lines": [],
                 "dose_columns": header["dose_columns"],
                 "detail_lines": [],
             }
@@ -371,6 +541,17 @@ def _extract_vaccine_sections(lines: list[dict[str, Any]]) -> list[dict[str, Any
 
         if current_section is None:
             continue
+
+        if _is_label_only_header_line(line, current_section):
+            _append_label_continuation(current_section, line_text)
+            continue
+
+        if _is_dose_only_header_line(line):
+            continuation_columns = _extract_dose_columns_from_line(line)
+            if continuation_columns:
+                _merge_section_dose_columns(current_section, continuation_columns)
+                current_section.setdefault("header_continuation_lines", []).append(line_text)
+                continue
 
         detail_blocks: list[dict[str, Any]] = []
         for block in line["blocks"]:
@@ -473,11 +654,14 @@ def _build_vaccination_reader(layout_artifact: dict[str, Any]) -> dict[str, Any]
                     }
                 )
 
+            doses.sort(key=_dose_sort_key)
             vaccines.append(
                 {
                     "page_number": page.get("page_number"),
                     "vaccine_label": section.get("vaccine_label"),
                     "header_line_text": section.get("header_line_text"),
+                    "header_continuation_lines": section.get("header_continuation_lines", []),
+                    "label_continuation_lines": section.get("label_continuation_lines", []),
                     "doses": doses,
                 }
             )
@@ -499,6 +683,16 @@ def _render_reader_text(reader: dict[str, Any]) -> str:
         lines.append("")
         lines.append(f"VACCINE: {vaccine.get('vaccine_label')}")
         lines.append(f"HEADER: {vaccine.get('header_line_text')}")
+        continuation_lines = vaccine.get("header_continuation_lines", [])
+        if continuation_lines:
+            lines.append("HEADER_CONTINUATIONS:")
+            for continuation_line in continuation_lines:
+                lines.append(f"- {continuation_line}")
+        label_continuation_lines = vaccine.get("label_continuation_lines", [])
+        if label_continuation_lines:
+            lines.append("LABEL_CONTINUATIONS:")
+            for continuation_line in label_continuation_lines:
+                lines.append(f"- {continuation_line}")
         for dose in vaccine.get("doses", []):
             lines.append(
                 f"DOSE {dose.get('dose_number')} | DATE {dose.get('date')} | CONFIDENCE {dose.get('confidence')}"
@@ -961,8 +1155,10 @@ def phase5_build_prompt_input(
     metadata: dict[str, Any],
     interpretation: dict[str, Any],
 ) -> dict[str, Any]:
+    document_id = pdf_path.stem
     interpreted_json = {
         "document": {
+            "document_id": document_id,
             "source_path": str(pdf_path),
             "document_family": classification["document_family"].value,
             "document_subcategory": classification.get("document_subcategory"),
@@ -1012,16 +1208,40 @@ def _write_debug_artifacts(paths: dict[str, Path], interpretation: dict[str, Any
         )
 
 
-def main() -> int:
-    args = _build_parser().parse_args()
-    pdf_path = args.pdf.resolve()
+def _resolve_requested_pdfs(args: argparse.Namespace) -> tuple[list[Path], list[str]]:
+    raw_root = args.raw_root.resolve()
+    warnings: list[str] = []
 
-    if not pdf_path.exists():
-        print(f"ERRORE: PDF non trovato in {pdf_path}")
-        return 1
+    # Comportamento di default: gira su tutte le persone e cerca automaticamente
+    # l'unico CertificatoVaccinale*.pdf per ciascuna cartella paziente.
+    if args.vaccini_all or not args.person:
+        if not raw_root.exists():
+            return [], [f"root documenti non trovata: {raw_root}"]
+        return _discover_vaccination_pdfs(raw_root)
 
+    person_dir = raw_root / args.person
+    if not person_dir.exists():
+        return [], [f"cartella paziente non trovata: {person_dir}"]
+    pdf_path = _find_unique_vaccination_pdf(person_dir)
+    if pdf_path is None:
+        matches = sorted(path.name for path in person_dir.glob(VACCINATION_GLOB) if path.is_file())
+        if not matches:
+            return [], [f"{args.person}: nessun {VACCINATION_GLOB} trovato"]
+        return [], [f"{args.person}: trovati piu certificati vaccinali: {', '.join(matches)}"]
+    return [pdf_path], warnings
+
+
+def _run_stage1_for_pdf(pdf_path: Path, args: argparse.Namespace) -> int:
     document_root = _resolve_document_artifact_dir(pdf_path, args.artifacts_root.resolve())
     paths = _artifact_paths(document_root)
+
+    if not args.force and _has_stage1_outputs(document_root):
+        print("=== STAGE 1 GIA PRONTO ===")
+        print(f"-> Documento: {pdf_path.name}")
+        print(f"-> Artefatti esistenti: {paths['document_dir']}")
+        print("-> Salto l'estrazione per evitare passaggi inutili. Si puo passare direttamente alla fase dopo.")
+        return 0
+
     paths["document_dir"].mkdir(parents=True, exist_ok=True)
 
     print("=== AVVIO TEST STAGE 1 ===")
@@ -1078,6 +1298,33 @@ def main() -> int:
     print("-> Il prompt e pronto per stage2.")
     print(f"-> Usa test_stage2.py con: {paths['prompt_main']}")
     return 0
+
+
+def main() -> int:
+    args = _build_parser().parse_args()
+    pdf_paths, warnings = _resolve_requested_pdfs(args)
+
+    for warning in warnings:
+        print(f"ATTENZIONE: {warning}")
+
+    if not pdf_paths:
+        print("ERRORE: nessun documento da processare.")
+        return 1
+
+    exit_code = 0
+    for index, pdf_path in enumerate(pdf_paths, start=1):
+        if len(pdf_paths) > 1:
+            print(f"\n##### CERTIFICATO VACCINALE {index}/{len(pdf_paths)} #####")
+            print(f"-> Persona: {pdf_path.parent.name}")
+            print("-> In modalita vaccini stage1 cerco automaticamente l'unico file che inizia con 'CertificatoVaccinale'.")
+        if not pdf_path.exists():
+            print(f"ERRORE: PDF non trovato in {pdf_path}")
+            exit_code = 1
+            continue
+        run_code = _run_stage1_for_pdf(pdf_path.resolve(), args)
+        if run_code != 0:
+            exit_code = run_code
+    return exit_code
 
 
 if __name__ == "__main__":

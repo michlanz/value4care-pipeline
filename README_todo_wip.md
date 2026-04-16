@@ -1,17 +1,36 @@
 ﻿# README todo wip
 
+source .venv/bin/activate
+
+- il parser va modificato perché deve accorgersi dei vaccini che scavallano la pagina
+- lo stage 5 dà problemi di visualizzazione perché prende le età e non le medie (ancora...)
+- meno file inutili salvati perché non me ne frega ninete
+- vaccini completamente certicalizzati? boh vorrei farli almeno incrociati
+
+
+Stato consolidato dell'ultimo giro:
+- stage1 vaccini gestisce meglio le righe spezzate delle dosi e usa `document_id = pdf_stem` come chiave stabile
+- stage3 tiene `documenti_importati` per saltare i documenti gia caricati
+- stage4 usa di nuovo il DFG standard di PM4Py, con una patch minima per mostrare anche i casi a evento singolo
+- stage5 in vista aggregata mostra traiettorie medie per eta e non sovrappone tutti i pazienti
+
+
 ## focus attuale
 
-Stiamo chiudendo prima il flusso vaccini.
-In questo momento il focus non e' piu' il refactor base di `stage1`, ma:
-- guardare il prompt prodotto da `stage1`
-- fare test locali su vaccini
-- rifinire il comportamento prima di passare agli altri tipi di documento
+Stiamo lavorando sul ramo vaccini end-to-end:
+- `test_stage1.py` per lettura e interpretazione
+- `test_stage3.py` per database verticale vaccini + anagrafiche
+- `test_stage4.py` per event log e process mining
+- `test_stage5.py` come interfaccia locale principale
+
+In questo momento la priorita' non e' React.
+La UI di riferimento resta `test_stage5.py`, tutta locale, senza dipendenze web esterne.
+React resta una possibilita' futura, ma solo quando la forma dei dati e delle viste sara' piu stabile.
 
 Per ora non stiamo ancora aggiornando i sorgenti veri sotto `src/`.
 Le decisioni consolidate restano in `statolavori.txt`.
 
-## task 1 - rifondare stage1
+## task 1 - vaccini end-to-end
 
 Gia' fatto:
 - rinominato `smoke_test_stages_1_to_5.py` in `test_stage1.py`
@@ -21,25 +40,33 @@ Gia' fatto:
 - chiarita la distinzione tra logica comune e logica vaccini
 - standardizzati gli artefatti base di `stage1`
 - spostati `layout_*` e `reader_*` tra gli artefatti di debug
+- raffinata l'anagrafica vaccini nel JSON interpretato
+- introdotto `document_snapshot_date` dal filename del certificato
+- creato `aggregated database/vaccini.sqlite`
+- creato `aggregated database/anagrafiche_pazienti.sqlite`
+- aggiunto `sessione_id` ai vaccini
+- costruiti gli output stage 4:
+  - log progressione
+  - validation report
+  - summary JSON
+  - XES
+- costruita `test_stage5.py` come dashboard locale per il mining vaccini
 
-Ancora da fare su task 1:
-- per adesso la pipeline si concentra solo sui vaccini, senza valutare gli altri tipi di documenti
-- migliorare il prompt prodotto da `stage1`, che e' il vero output verso `stage2`
-- rifinire l'estrazione anagrafica e dei metadati base nel caso vaccini
-- verificare che `interpreted_text.txt` e `interpreted_text.json` siano davvero chiari e utili
+Ancora da fare sul ramo vaccini:
+- rifinire ancora la resa del grafo verticale di `test_stage5.py` quando serve
+- chiarire sempre meglio il confine tra vista di process mining pura e vista clinica aggregata
+- capire se tenere o meno il branch LLM per i vaccini come fallback o confronto
+- decidere quando considerare stabile il flusso vaccini e iniziare il porting verso `src/`
+
+## task 2 - stage 1 non vaccini
+
 - testare anche altri tipi di documenti:
   - `Documento_sanitario_*`
   - `Ricetta_*`
   - `Riepilogo_*` solo in modo minimo
 - capire se i tag iniziali dei documenti non vaccinali sono gia' abbastanza utili oppure no
-
-## task 2 - flusso vaccini e prompt
-
-- fare prove locali sul prompt vaccini partendo dall'output di `test_stage1.py`
-- capire come deve essere fatto il prompt prima di rifinirlo nel codice
-- usare `test_stage2.py` come runner separato per i test LLM
-- confrontare prompt diversi sullo stesso documento vaccinale, se utile
-- tenere tracciati prompt e risposte come artefatti
+- definire la forma minima di `interpreted_text.json` per i documenti non vaccinali
+- chiarire quali metadati si riescono a estrarre in modo robusto senza LLM
 
 ## task 3 - parser e classificazione documentale
 
@@ -57,21 +84,31 @@ Ancora da fare su task 1:
   - catalogo estensibile nel tempo
 - non trattare il `riepilogo` come priorita' attuale
 
-## task 4 - metadati base e json intermedi
+## task 4 - database e modelli intermedi
 
-- capire quali campi possiamo estrarre bene gia' in `stage1`
-- minimo candidato:
-  - nome e cognome
-  - codice fiscale
-  - data di nascita
-  - residenza/indirizzo se presente
-  - date tipizzate del documento
-  - famiglia documento
-  - sottocategoria/tag
 - progettare meglio:
   - json paziente cumulativo
   - `document_event.json`
   - `document_findings.json`
+- decidere come estendere `aggregated database/` a:
+  - documenti sanitari
+  - ricette
+  - eventuale database aggregato finale
+- chiarire come collegare artefatti, eventi e verticali cliniche senza mischiare livelli diversi
+
+## task 5 - interfaccia locale
+
+Gia' deciso:
+- `test_stage5.py` e' la UI locale di riferimento per ora
+- niente React come priorita' immediata
+- niente dipendenze internet o servizi esterni
+
+Ancora da fare:
+- continuare a migliorare il grafo verticale della progressione
+- decidere quali controlli tenere stabili e quali sono solo sperimentali
+- capire se aggiungere una separazione piu netta tra vista di mining e vista clinica
+- capire se aggiungere altre viste locali oltre alla progressione vaccini
+- valutare in seguito se conviene trasformare la UI locale in uno stage 5 piu strutturato
 
 ## questioni aperte ma non bloccanti
 
@@ -81,6 +118,7 @@ Ancora da fare su task 1:
 - quando passare dai test ai sorgenti veri sotto `src/`
 - quando valutare vLLM al posto di Ollama
 - fare un database unificato di tutte le categorie di `Documento_sanitario_*` per migliorare il tagging
+- se React servira' davvero in futuro o se la UI locale restera' sufficiente piu a lungo del previsto
 
 ## vincoli attivi
 
@@ -89,7 +127,9 @@ Ancora da fare su task 1:
 - i vaccini hanno una logica dedicata
 - il prompt e' output di `stage1`
 - `stage2` deve solo eseguire e registrare
+- il database e gli artefatti sono incrementali: niente cleanup automatico
 - la struttura minima di database gia' definita in `statolavori.txt` non va persa
+- la UI deve restare tutta locale, senza internet vero
 
 ## riferimenti
 

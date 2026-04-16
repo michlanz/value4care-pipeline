@@ -1,7 +1,7 @@
 ﻿VALUE4CARE PIPELINE
 Stato del progetto, decisioni consolidate e prompt operativi
 
-Ultimo aggiornamento: 2026-04-13
+Ultimo aggiornamento: 2026-04-16
 
 ---
 
@@ -595,3 +595,236 @@ In alternativa, se si vuole ancora testare l LLM:
 1. Usare il `reader_text.txt` come input
 2. Ridurre la dimensione del prompt o il numero di vaccini passati per prova
 3. Considerare un modello locale piu leggero se `qwen3:30b-a3b` continua a non rispondere in tempi utili
+
+---
+
+16. AGGIORNAMENTO CONSOLIDATO AL 2026-04-16
+
+---
+
+Stato reale verificato del ramo vaccini
+
+* Il flusso vaccini oggi arriva fino a una visualizzazione locale funzionante
+* La catena attiva e:
+  * `test_stage1.py`
+  * `test_stage3.py`
+  * `test_stage4.py`
+  * `test_stage5.py`
+* Questo flusso viene considerato oggi la reference implementation sperimentale del progetto
+
+Stage 1 vaccini
+
+* `test_stage1.py` e il nuovo runner di riferimento per la lettura locale
+* Lo stage 1 si ferma prima del modello
+* Produce artefatti standard sotto:
+  * `artifacts/<person>/<document_id>/`
+* Artefatti standard attivi:
+  * `extracted_text.txt`
+  * `interpreted_text.txt`
+  * `interpreted_text.json`
+  * `prompt_main.txt`
+* Artefatti debug vaccini ancora disponibili:
+  * `layout_text.txt`
+  * `layout_words.json`
+  * `reader_text.txt`
+  * `reader.json`
+
+Dati vaccini gia sistemati bene in stage 1
+
+* anagrafica paziente estratta in modo separato dal contenuto clinico
+* `document_snapshot_date` ricavata dal filename del certificato
+* normalizzazione residenza e indirizzo migliorata
+* distinzione piu chiara tra metadati paziente e contenuto vaccinale
+
+Stage 2 vaccini
+
+* `test_stage2.py` esiste ancora come runner LLM separato
+* Tuttavia il ramo vaccini non dipende piu dall LLM per funzionare end-to-end
+* Il branch LLM vaccini va considerato opzionale, utile solo come confronto o fallback sperimentale
+
+Stage 3 vaccini consolidato
+
+* Il database vaccini non usa piu naming `stage3` nei file finali
+* La cartella attiva e:
+  * `aggregated database/`
+* File attivi gia presenti:
+  * `vaccini.sqlite`
+  * `anagrafiche_pazienti.sqlite`
+* Per ora non esiste ancora un database aggregato unico cross-documento
+
+Schema pratico oggi usato per `vaccini.sqlite`
+
+* una riga per dose
+* colonne attive:
+  * `codice_persona`
+  * `data`
+  * `tipo_documento`
+  * `tipo_evento`
+  * `sottotipo_evento`
+  * `specifiche_sottotipo_evento`
+  * `sessione_id`
+  * `care_thread`
+  * `ente_erogatore`
+  * `note`
+  * `origine_documento`
+
+Decisioni consolidate sul database vaccini
+
+* `specifiche_sottotipo_evento` resta numerica, non testuale tipo `dose 1`
+* `sessione_id` va mantenuto nello SQLite
+* `sessione_id = codice_persona::data`
+* il database e gli artefatti vanno trattati come incrementali
+* non vanno introdotte funzioni automatiche di cleanup o cancellazione
+
+Schema pratico oggi usato per `anagrafiche_pazienti.sqlite`
+
+* tabella osservazionale separata dagli eventi
+* colonne attive:
+  * `codice_paziente`
+  * `nome`
+  * `cognome`
+  * `nome_completo`
+  * `codice_fiscale`
+  * `data_nascita`
+  * `luogo_nascita`
+  * `citta_residenza`
+  * `indirizzo_residenza`
+  * `data_rilevamento`
+
+Decisione consolidata su anagrafiche
+
+* l anagrafica non va joinata automaticamente al verticale eventi
+* resta un archivio separato ma coerente
+
+Stage 4 vaccinazioni consolidato
+
+* `test_stage4.py` legge `vaccini.sqlite` e genera gli output di mining locali
+* I file vengono salvati sotto:
+  * `aggregated database/vaccini_mining/`
+* Output stabili oggi usati:
+  * `vaccini_progressione_log.xes`
+  * `vaccini_progressione_log.json`
+  * `vaccini_progressione_log_summary.json`
+  * `vaccini_validation_report.json`
+* Gli output relativi alle sessioni vaccinali restano disponibili come supporto tecnico, ma non sono piu la vista UI prioritaria
+
+Decisioni consolidate sul mining vaccini
+
+* La vista principale da mostrare e la progressione per vaccino
+* La vista sessioni vaccinali resta secondaria e tecnica
+* Ogni vaccino deve avere il proprio filo distinto nel mining
+* Il case pratico del log progressione e:
+  * `codice_persona::sottotipo_evento`
+* L activity mostrata nel log progressione include vaccino e dose
+* I tempi tra dosi vanno mantenuti come informazione esplicita
+
+Stage 5 locale consolidato
+
+* `test_stage5.py` e la UI di riferimento attuale
+* Non usa React
+* Non usa Node
+* Non usa dipendenze web esterne
+* E una dashboard locale FastAPI + HTML/SVG/JavaScript vanilla
+* Resta interamente offline e privacy first
+
+Decisione consolidata sulla UI
+
+* Per ora non conviene passare a React
+* La UI locale attuale e piu adatta alla fase di esplorazione rapida del dominio
+* React potra essere valutato piu avanti solo se:
+  * la forma dei dati si stabilizza
+  * le viste diventano piu numerose e complesse
+  * nasce un vero bisogno di separazione frontend/backend
+
+Stato reale dell interfaccia stage 5
+
+* La vista principale e un grafo verticale della progressione vaccinale
+* Il tempo scende dall alto verso il basso
+* Esiste una scala laterale di tempo eta del soggetto
+* Esistono toggle per mostrare o nascondere i vaccini
+* Esiste un toggle per ordinamento:
+  * alfabetico
+  * cronologico
+* L ordinamento cronologico oggi segue questa regola consolidata:
+  * criterio primario = prima data di prima somministrazione
+  * criterio secondario = data di ultima somministrazione
+  * poi confronto della traiettoria completa delle dosi
+* Questo ordinamento e stato introdotto per ottenere un colpo d occhio piu diagonale e piu naturale
+
+Decisione consolidata sulla legenda
+
+* La legenda separata e stata rimossa dalla UI
+* I filtri vaccino sono il controllo principale e rendono la legenda ridondante
+
+Decisione consolidata sulla vista sessioni
+
+* La vista sessioni vaccinali e stata rimossa come modalita separata della UI
+* Le sessioni restano usate solo come supporto visivo e strutturale dove utile
+* Non sono oggi il focus principale della visualizzazione
+
+Principio di lavoro confermato
+
+* Continuiamo a usare i runner `test_stage*` come spazio di sperimentazione principale
+* Il porting nei sorgenti sotto `src/` resta rinviato fino a quando il ramo vaccini non sara considerato abbastanza stabile
+
+Prossimo focus consigliato
+
+* Tenere il ramo vaccini come baseline stabile
+* Passare poi agli altri tipi documentali mantenendo la stessa filosofia:
+  * massimizzare parsing deterministico dove possibile
+  * usare LLM il meno possibile
+  * costruire database e mining tracciabili
+  * mantenere la UI locale come vista di verifica rapida
+
+Aggiornamento consolidato del 2026-04-16 - seconda iterazione vaccini multipaziente
+
+Stage 1 vaccini ulteriormente consolidato
+
+* `test_stage1.py` usa `document_id = pdf_stem` come chiave stabile del documento vaccinale
+* Lo skip di stage1 resta completamente filesystem-based
+* Il parser vaccini ora gestisce correttamente:
+  * dosi che vanno a capo su una riga separata
+  * continuation lines nell header delle dosi
+  * ordinamento canonico delle dosi anche quando l ordine visuale nel PDF e sparso
+* Il fix e stato verificato sui casi reali di `person002`:
+  * `DIFTERITE` recupera la dose 4
+  * `TETANO` recupera la dose 1
+  * `COVID 19` viene normalizzato a 1-2-3
+
+Stage 3 vaccini ulteriormente consolidato
+
+* `test_stage3.py` tiene una tabella `documenti_importati` dentro `vaccini.sqlite`
+* Lo skip di stage3 e documentale, non per singola riga evento
+* Il database vaccini resta incrementale e separato dagli artifact stage1
+
+Stage 4 vaccini ulteriormente consolidato
+
+* Il log e il summary vedevano gia i casi singoli, ma il PNG del DFG li perdeva nella resa grafica
+* La soluzione finale adottata e:
+  * mantenere il renderer standard PM4Py per il DFG progressione
+  * aggiungere solo una patch minima per far comparire anche i casi a evento singolo
+* Questo permette di conservare:
+  * colori standard PM4Py
+  * intensita piu scura sui nodi piu frequenti
+  * conteggi aggregati corretti sui nodi condivisi
+* Esempi verificati:
+  * `HAEMOPHILUS - Dose 1` frequenza 2
+  * `PAPILLOMAVIRUS - Dose 1` frequenza 2
+* Sono stati eliminati i nodi hash numerici che comparivano come placeholder grafici
+
+Stage 5 vaccini ulteriormente consolidato
+
+* La vista aggregata non sovrappone piu tutti i pazienti come traiettorie indipendenti
+* La vista aggregata usa una logica a medie di coorte per vaccino/dose
+* L asse verticale e stato riportato a sola eta, non a data assoluta
+* Le etichette floating dei gap nella vista aggregata sono state rimosse per ridurre rumore visivo
+
+Decisione concettuale sulla UI
+
+* La vista di `test_stage5.py` non va interpretata come visualizzazione classica di process mining
+* Va considerata soprattutto una vista clinica aggregata costruita sopra gli output del mining
+* Il process mining puro resta rappresentato da:
+  * DFG
+  * varianti
+  * process tree
+  * statistiche di transizione

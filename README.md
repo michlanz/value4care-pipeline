@@ -1,118 +1,203 @@
-# value4care-pipeline
+﻿# value4care-pipeline
 
-## pipeline dai pdf dei fascicoli fino a qualcosa che può essere usato dal process mining
+## pipeline offline dai pdf del fascicolo sanitario fino a database, process mining e visualizzazione locale
 
-## struttura del progetto
+## stato sintetico attuale
+
+Oggi la pipeline e' organizzata in 5 fasi concettuali:
+
+1. `stage1` = lettura PDF, classificazione, interpretazione iniziale, metadati base, prompt output
+2. `stage2` = runtime LLM locale quando serve
+3. `stage3` = salvataggio su database e strutture persistenti
+4. `stage4` = costruzione event log e process mining
+5. `stage5` = visualizzazione locale dei risultati
+
+Il ramo oggi piu' avanzato e verificato e' quello dei vaccini.
+Per i vaccini abbiamo gia' un flusso end-to-end sperimentale che arriva fino alla visualizzazione locale.
+Per gli altri tipi di documento la pipeline e' ancora in fase di estensione.
+
+## stato pratico dei runner di test
+
+In questa fase il lavoro principale vive nei runner `test_stage*`:
+
+- `test_stage1.py`
+  lettura e interpretazione locale del documento
+- `test_stage2.py`
+  runner separato per prove LLM locali
+- `test_stage3.py`
+  costruzione del database locale per i vaccini
+- `test_stage4.py`
+  costruzione degli event log e dei file di mining
+- `test_stage5.py`
+  dashboard locale per esplorare i risultati del process mining
+
+Regola attuale di lavoro:
+- prima si valida nei runner di test
+- poi, solo quando una strategia e' abbastanza stabile, si porta dentro `src/`
+
+## struttura del repository
 
 ### root del repository
 
 - `main.py`
-  launcher principale del progetto. Per ora serve soprattutto ad avviare la CLI.
+  launcher principale del progetto
 - `README.md`
-  panoramica generale del progetto e della struttura del codice.
-- `README_comandi.md`
-  guida pratica ai comandi da terminale disponibili oggi.
+  panoramica generale del progetto
+- `README_todo_wip.md`
+  task aperte e focus del momento
 - `statolavori.txt`
-  diario tecnico e roadmap aggiornata del progetto.
+  stato tecnico consolidato e decisioni di progetto
+- `test_stage1.py`
+  stage 1 sperimentale locale
+- `test_stage2.py`
+  stage 2 sperimentale locale
+- `test_stage3.py`
+  stage 3 sperimentale locale
+- `test_stage4.py`
+  stage 4 sperimentale locale
+- `test_stage5.py`
+  stage 5 sperimentale locale
+- `artifacts/`
+  artefatti documentali generati dai test
+- `aggregated database/`
+  database locali e output di mining
 - `data/`
-  dataset di lavoro attivo.
+  dataset di lavoro attivo
 - `data.zip`
-  copia di backup del dataset.
+  copia di backup del dataset
 - `requirements/`
-  dipendenze Python del progetto.
-- `tests/`
-  test minimi sulla struttura iniziale.
+  dipendenze Python del progetto
+- `src/`
+  sorgenti veri del progetto, ancora da riallineare pienamente alle soluzioni validate nei test
 
 ### cartella `src/`
 
 - `clinical.py`
-  contiene i concetti clinici comuni del progetto: documento, diagnosi, evento clinico, care thread.
+  concetti clinici comuni del progetto
 - `config.py`
-  raccoglie configurazione e percorsi principali del progetto.
+  configurazione e percorsi principali
 
 ### pacchetti principali in `src/`
 
-- `pdf_reading/`
-  selezione dei PDF, classificazione iniziale dal filename, estrazione del testo con `pdfplumber`.
-- `llm_runtime/`
-  comunicazione con Ollama, prompt e parsing delle risposte del modello.
-- `database/`
-  struttura logica della persistenza, tabelle previste e percorsi degli artefatti.
-- `mining/`
-  trasformazione degli eventi clinici in event log e primi filtri utili al process mining.
-- `interface/`
-  punti di ingresso del progetto: oggi CLI, più avanti anche API o interfaccia interattiva.
+- `stage1_pdf_reading/`
+  lettura PDF e classificazione iniziale
+- `stage2_llm_runtime/`
+  runtime LLM locale
+- `stage3_database/`
+  persistenza e schema logico
+- `stage4_mining/`
+  trasformazione in event log e filtri mining
+- `stage5_interface/`
+  interfacce di accesso; oggi la UI locale di riferimento vive ancora in `test_stage5.py`
 
-## cos'è la CLI
+## cosa significa ogni fase oggi
 
-CLI significa `Command Line Interface`, cioè interfaccia a riga di comando.
+### stage 1
 
-In pratica:
+Legge il PDF e costruisce una rappresentazione utile del documento.
 
-- invece di cliccare bottoni su una schermata
-- scrivi un comando nel terminale
-- il programma esegue quell'azione e ti mostra il risultato
+Per i vaccini oggi comprende gia':
+- estrazione testo
+- interpretazione layout-aware
+- anagrafica paziente
+- date tipizzate
+- contenuto clinico separato dai metadati anagrafici
+- gestione robusta di dosi spezzate su piu righe e continuation lines nell header vaccinale
+- `document_id` stabile uguale al nome del PDF, usato per organizzare e skippare gli artifact stage1
+- prompt base come output verso stage 2
 
-Nel nostro progetto, per esempio, la CLI è la parte che permette di fare cose come:
+### stage 2
 
-- controllare la configurazione
-- elencare i PDF
-- classificare un documento dal filename
-- estrarre il testo da un PDF
+Esegue il modello locale solo quando serve.
 
-Quindi:
+Per i vaccini oggi non e' piu' il ramo principale:
+- il parsing deterministico e' preferito
+- il runner LLM resta utile per confronto o fallback
 
-- `main.py` è il launcher
-- `src/interface/cli.py` contiene i comandi da terminale
+### stage 3
 
-## cos'è un care_thread
+Salva i dati in strutture persistenti locali.
 
-`care_thread` è il contenitore logico che raggruppa documenti ed eventi che fanno parte dello stesso filo clinico.
+Per i vaccini oggi produce:
+- `aggregated database/vaccini.sqlite`
+- `aggregated database/anagrafiche_pazienti.sqlite`
+- tracking documentale incrementale con `documenti_importati` per evitare reimport inutili in stage3
 
-Esempi:
+### stage 4
 
-- una frattura, con visita, radiografia, referto e ricette collegate
-- una gastroscopia, con prescrizione, esame e referto finale
-- un percorso più lungo, nato da sintomi continui o da una diagnosi emersa nel tempo
+Costruisce gli event log e gli output per il process mining.
 
-Serve perché spesso i collegamenti clinici non sono solo tra due documenti singoli, ma tra più documenti ed eventi che appartengono allo stesso percorso.
+Per i vaccini oggi produce:
+- `.xes`
+- log json
+- summary json
+- validation report
+- grafi/artefatti di mining
+- DFG progressione con stile standard PM4Py e patch minima per mostrare anche i casi a evento singolo
 
-## ordine consigliato per leggere il codice
+### stage 5
 
-Se vuoi orientarti senza perderti, conviene aprire i file in questo ordine:
+Visualizza i risultati in locale.
 
-1. `main.py`
-2. `src/interface/cli.py`
-3. `src/config.py`
-4. `src/clinical.py`
-5. `src/pdf_reading/`
-6. `src/llm_runtime/`
-7. `src/database/`
-8. `src/mining/`
+Oggi la UI di riferimento e':
+- `test_stage5.py`
+- locale only
+- senza React
+- senza dipendenze web esterne
+- con grafo interattivo SVG per la progressione vaccinale
+- vista aggregata basata su eta medie di coorte, non su tutti i pazienti sovrapposti
+- asse verticale in eta, non in data assoluta
 
-## idea generale dell'architettura
+## principi architetturali confermati
 
-La pipeline è pensata così:
+- tutto deve restare offline e privacy first
+- l'LLM deve essere locale
+- il database non deve essere confuso con gli artefatti tecnici
+- il database e gli artefatti sono incrementali
+- niente cleanup automatico dei file generati
+- i vaccini hanno una logica dedicata
+- bisogna usare l'LLM il meno possibile quando un parser deterministico e' sufficiente
 
-PDF -> lettura testo -> interpretazione LLM -> validazione backend -> strutture dati -> event log -> process mining
+## ordine consigliato per orientarsi oggi
 
-Separazioni importanti:
+Se vuoi capire il progetto nello stato reale attuale, conviene leggere in questo ordine:
 
-- `pdf_reading` legge i documenti ma non interpreta clinicamente il contenuto
-- `llm_runtime` interpreta il contenuto ma non salva direttamente nel database
-- `database` si occupa della persistenza, non della lettura dei PDF
-- `mining` lavora su eventi già strutturati, non sui PDF raw
+1. `README.md`
+2. `README_todo_wip.md`
+3. `statolavori.txt`
+4. `test_stage1.py`
+5. `test_stage3.py`
+6. `test_stage4.py`
+7. `test_stage5.py`
+8. `src/`
 
-## esempio utile da terminale
+## comandi utili oggi
 
-Per vedere solo i PDF vaccinali senza passare da tutto il dataset:
+Attivare il venv:
 
 ```bash
-python main.py list-pdfs --family vaccination_certificate
+source .venv/bin/activate
 ```
 
-Per estrarre il testo da uno specifico certificato vaccinale:
+Lanciare il flusso vaccini sperimentale:
 
 ```bash
-python main.py extract-text data/raw/person001/CertificatoVaccinale_LMNLCU02E15D918M_20260303104746.pdf
+python test_stage1.py
+python test_stage3.py
+python test_stage4.py
+python test_stage5.py
 ```
+
+Poi aprire in locale:
+
+```text
+http://127.0.0.1:8050
+```
+
+## punto di attenzione attuale
+
+La pipeline completa e' oggi davvero matura soprattutto sul caso vaccini.
+Il prossimo passo robusto non e' aggiungere subito complessita' di UI o framework frontend, ma:
+- aggiungere altri pazienti
+- verificare che database e mining reggano su piu' casi
+- estendere poi la stessa struttura agli altri tipi documentali

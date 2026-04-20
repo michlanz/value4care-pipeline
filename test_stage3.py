@@ -11,6 +11,7 @@ Per ora non crea nessun database aggregato e non passa dall'LLM.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import re
 import sqlite3
@@ -18,16 +19,15 @@ from pathlib import Path
 from typing import Any
 
 ROOT_DIR = Path(__file__).resolve().parent
-DEFAULT_INTERPRETED_JSON = (
-    ROOT_DIR
-    / "artifacts"
-    / "person001"
-    / "CertificatoVaccinale_LMNLCU02E15D918M_20260303104746"
-    / "interpreted_text.json"
-)
 DEFAULT_DB_DIR = ROOT_DIR / "aggregated database"
 DEFAULT_ARTIFACTS_ROOT = ROOT_DIR / "artifacts"
-VACCINATION_DIR_GLOB = "CertificatoVaccinale*"
+DEFAULT_UTILITY_DIR = ROOT_DIR / "data" / "utility"
+VACCINI_NOMI_TSV_NAME = "vaccini_nomi.tsv"
+LEGACY_VACCINI_NOMI_CSV_NAME = "vaccini_nomi.csv"
+
+
+def _looks_like_vaccination_artifact_dir(path: Path) -> bool:
+    return path.is_dir() and "vaccin" in path.name.casefold() and (path / "interpreted_text.json").exists()
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -37,7 +37,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--interpreted-json",
         type=Path,
-        default=DEFAULT_INTERPRETED_JSON,
         help="Path a interpreted_text.json prodotto da test_stage1.py",
     )
     parser.add_argument(
@@ -63,6 +62,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Cartella in cui creare vaccini.sqlite e anagrafiche_pazienti.sqlite",
     )
     parser.add_argument(
+        "--utility-dir",
+        type=Path,
+        default=DEFAULT_UTILITY_DIR,
+        help="Cartella utility per le trasformazioni effective dei vaccini.",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Reimporta un documento anche se nel database risultano gia righe con la stessa origine documento.",
@@ -75,11 +80,7 @@ def _load_interpreted_json(path: Path) -> dict[str, Any]:
 
 
 def _find_vaccination_artifacts_for_person(person_dir: Path) -> list[Path]:
-    return sorted(
-        path / "interpreted_text.json"
-        for path in person_dir.glob(VACCINATION_DIR_GLOB)
-        if path.is_dir() and (path / "interpreted_text.json").exists()
-    )
+    return sorted(path / "interpreted_text.json" for path in person_dir.iterdir() if _looks_like_vaccination_artifact_dir(path))
 
 
 def _discover_vaccination_artifacts(artifacts_root: Path) -> tuple[list[Path], list[str]]:
@@ -118,6 +119,22 @@ def _normalize_date(raw: str | None) -> str | None:
     return f"{year}-{month}-{day}"
 
 
+def _derive_gender_from_tax_code(tax_code: str | None) -> str | None:
+    """Deriva il genere dal giorno codificato nel codice fiscale."""
+    cleaned = str(tax_code or "").strip().upper()
+    if len(cleaned) < 11:
+        return None
+    raw_day = cleaned[9:11]
+    if not raw_day.isdigit():
+        return None
+    day_value = int(raw_day)
+    if day_value < 35:
+        return "M"
+    if day_value > 35:
+        return "F"
+    return None
+
+
 def _flatten_note_text(exact_detail_texts: list[str], ambiguous_detail_blocks: list[dict[str, Any]]) -> str | None:
     parts: list[str] = []
     for item in exact_detail_texts:
@@ -142,57 +159,297 @@ def _flatten_note_text(exact_detail_texts: list[str], ambiguous_detail_blocks: l
     return " | ".join(deduped)
 
 
-def _build_vaccini_rows(payload: dict[str, Any], interpreted_json_path: Path) -> list[dict[str, Any]]:
+def _effective_vaccination_sort_key(item: dict[str, Any]) -> tuple[str, str, int]:
+    """Ordina le dosi effective per data crescente con tie-break stabile."""
+    normalized_date = _normalize_date(item.get("data")) or "9999-99-99"
+    return (
+        normalized_date,
+        str(item.get("document_id") or ""),
+        int(item.get("payload_order") or 0),
+    )
+
+
+def _build_vaccini_raw_rows(payload: dict[str, Any], interpreted_json_path: Path) -> list[dict[str, Any]]:
+    """Costruisce le righe raw in memoria, senza correzioni semantiche."""
     codice_persona = _resolve_patient_code(interpreted_json_path, payload)
     document = payload.get("document", {})
     reader = payload.get("specialized", {}).get("vaccination_reader", {})
     origine_documento = document.get("source_path")
     document_id = document.get("document_id") or interpreted_json_path.parent.name
-    rows: list[dict[str, Any]] = []
+    ente_erogatore = document.get("issuing_authority") or ""
 
+    grouped_rows: dict[str, list[dict[str, Any]]] = {}
+    payload_order = 0
     for vaccine in reader.get("vaccines", []):
         vaccine_label = (vaccine.get("vaccine_label") or "vaccino_sconosciuto").strip()
         for dose in vaccine.get("doses", []):
-            dose_number_raw = dose.get("dose_number")
-            dose_number = int(dose_number_raw) if dose_number_raw else None
+            payload_order += 1
             administration_date = _normalize_date(dose.get("date"))
+            grouped_rows.setdefault(vaccine_label, []).append({
+                "codice_persona": codice_persona,
+                "data": administration_date,
+                "tipo_documento": "riepilogo vaccinale",
+                "tipo_evento": "vaccino",
+                "sottotipo_evento_raw": vaccine_label,
+                "dose_number_raw": dose.get("dose_number"),
+                "specifiche_sottotipo_evento": None,
+                "sessione_id": f"{codice_persona}::{administration_date}" if administration_date else None,
+                "care_thread": "vaccinazioni",
+                "ente_erogatore": ente_erogatore,
+                "note": _flatten_note_text(
+                    dose.get("exact_detail_texts", []),
+                    dose.get("ambiguous_detail_blocks", []),
+                ),
+                "origine_documento": origine_documento,
+                "document_id": document_id,
+                "payload_order": payload_order,
+            })
+
+    return sorted(
+        [row for vaccine_rows in grouped_rows.values() for row in vaccine_rows],
+        key=lambda row: (
+            row["codice_persona"],
+            row["sottotipo_evento_raw"],
+            row["payload_order"],
+            row["data"] or "",
+        ),
+    )
+
+
+def _resolve_vaccini_nomi_tsv_path(utility_dir: Path) -> Path:
+    """Restituisce il path del TSV utility dei nomi vaccino."""
+    return utility_dir / VACCINI_NOMI_TSV_NAME
+
+
+def _resolve_legacy_vaccini_nomi_csv_path(utility_dir: Path) -> Path:
+    """Restituisce il vecchio path CSV dei nomi vaccino, usato per migrazione morbida."""
+    return utility_dir / LEGACY_VACCINI_NOMI_CSV_NAME
+
+
+def _load_delimited_vaccini_rows(path: Path, delimiter: str) -> list[dict[str, str]]:
+    """Carica un file delimitato dei nomi vaccino se esiste gia."""
+    if not path.exists():
+        return []
+
+    rows: list[dict[str, str]] = []
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter=delimiter)
+        for row in reader:
+            nome_parsing = str(row.get("nome_parsing") or "").strip()
+            if not nome_parsing:
+                continue
             rows.append(
                 {
-                    "codice_persona": codice_persona,
-                    "data": administration_date,
-                    "tipo_documento": "riepilogo vaccinale",
-                    "tipo_evento": "vaccino",
-                    "sottotipo_evento": vaccine_label,
-                    "specifiche_sottotipo_evento": dose_number,
-                    "sessione_id": f"{codice_persona}::{administration_date}" if administration_date else None,
-                    "care_thread": "vaccinazioni",
-                    "ente_erogatore": "",
-                    "note": _flatten_note_text(
-                        dose.get("exact_detail_texts", []),
-                        dose.get("ambiguous_detail_blocks", []),
-                    ),
-                    "origine_documento": origine_documento,
-                    "document_id": document_id,
+                    "nome_parsing": nome_parsing,
+                    "nome_corrected": str(row.get("nome_corrected") or "").strip(),
                 }
             )
     return rows
 
 
+def _load_vaccini_nomi_rows(utility_dir: Path) -> list[dict[str, str]]:
+    """Carica i nomi vaccino dal TSV corrente o dal CSV legacy."""
+    tsv_path = _resolve_vaccini_nomi_tsv_path(utility_dir)
+    if tsv_path.exists():
+        return _load_delimited_vaccini_rows(tsv_path, "\t")
+
+    legacy_csv_path = _resolve_legacy_vaccini_nomi_csv_path(utility_dir)
+    if legacy_csv_path.exists():
+        return _load_delimited_vaccini_rows(legacy_csv_path, ",")
+
+    return []
+
+
+def _write_vaccini_nomi_tsv(tsv_path: Path, rows: list[dict[str, str]]) -> None:
+    """Scrive il TSV dei nomi vaccino in ordine alfabetico."""
+    tsv_path.parent.mkdir(parents=True, exist_ok=True)
+    with tsv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["nome_parsing", "nome_corrected"], delimiter="\t")
+        writer.writeheader()
+        for row in sorted(rows, key=lambda item: item["nome_parsing"].casefold()):
+            writer.writerow(
+                {
+                    "nome_parsing": row["nome_parsing"],
+                    "nome_corrected": row["nome_corrected"],
+                }
+            )
+
+
+def _sync_vaccini_nomi_csv(raw_rows: list[dict[str, Any]], utility_dir: Path) -> dict[str, str]:
+    """Allinea il TSV dei nomi vaccino senza sovrascrivere le correzioni manuali."""
+    tsv_path = _resolve_vaccini_nomi_tsv_path(utility_dir)
+    existing_rows = _load_vaccini_nomi_rows(utility_dir)
+    by_name = {row["nome_parsing"]: row for row in existing_rows}
+
+    unique_names = sorted(
+        {
+            str(row.get("sottotipo_evento_raw") or "").strip()
+            for row in raw_rows
+            if str(row.get("sottotipo_evento_raw") or "").strip()
+        },
+        key=str.casefold,
+    )
+
+    for name in unique_names:
+        by_name.setdefault(name, {"nome_parsing": name, "nome_corrected": ""})
+
+    merged_rows = list(by_name.values())
+    _write_vaccini_nomi_tsv(tsv_path, merged_rows)
+
+    overrides: dict[str, str] = {}
+    for row in merged_rows:
+        corrected = row["nome_corrected"].strip()
+        if corrected:
+            overrides[row["nome_parsing"]] = corrected
+    return overrides
+
+
+def _apply_vaccine_name_overrides(raw_rows: list[dict[str, Any]], overrides: dict[str, str]) -> list[dict[str, Any]]:
+    """Applica gli eventuali nomi effective ai vaccini raw."""
+    effective_rows: list[dict[str, Any]] = []
+    for row in raw_rows:
+        normalized_name = overrides.get(row["sottotipo_evento_raw"], row["sottotipo_evento_raw"])
+        effective_rows.append(
+            {
+                **row,
+                "sottotipo_evento": normalized_name,
+            }
+        )
+    return effective_rows
+
+
+def _apply_polivalenti_passthrough(effective_rows: list[dict[str, Any]], utility_dir: Path) -> list[dict[str, Any]]:
+    """Hook futuro per la gestione dei polivalenti; per ora lascia invariato il dataset."""
+    _ = utility_dir
+    return effective_rows
+
+
+def _linearize_vaccine_doses(effective_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Rinumera le dosi per paziente+vaccino in modo lineare e crescente."""
+    grouped_rows: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in effective_rows:
+        key = (row["codice_persona"], row["sottotipo_evento"])
+        grouped_rows.setdefault(key, []).append(row)
+
+    linearized_rows: list[dict[str, Any]] = []
+    for vaccine_rows in grouped_rows.values():
+        for linearized_index, row in enumerate(sorted(vaccine_rows, key=_effective_vaccination_sort_key), start=1):
+            linearized_rows.append(
+                {
+                    **row,
+                    "specifiche_sottotipo_evento": linearized_index,
+                }
+            )
+    return linearized_rows
+
+
+def _strip_internal_vaccini_fields(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Rimuove i campi interni del passaggio raw -> effective prima di scrivere il DB."""
+    cleaned_rows: list[dict[str, Any]] = []
+    for row in rows:
+        cleaned_rows.append(
+            {
+                key: value
+                for key, value in row.items()
+                if key not in {"payload_order", "dose_number_raw", "sottotipo_evento_raw"}
+            }
+        )
+    return cleaned_rows
+
+
+def _build_vaccini_rows(payload: dict[str, Any], interpreted_json_path: Path, utility_dir: Path) -> list[dict[str, Any]]:
+    """Costruisce le righe finali effective a partire dal livello raw in memoria."""
+    raw_rows = _build_vaccini_raw_rows(payload, interpreted_json_path)
+    overrides = _sync_vaccini_nomi_csv(raw_rows, utility_dir)
+    effective_rows = _apply_vaccine_name_overrides(raw_rows, overrides)
+    effective_rows = _apply_polivalenti_passthrough(effective_rows, utility_dir)
+    effective_rows = _linearize_vaccine_doses(effective_rows)
+    effective_rows = _strip_internal_vaccini_fields(effective_rows)
+    return sorted(
+        effective_rows,
+        key=lambda row: (
+            row["codice_persona"],
+            row["sottotipo_evento"],
+            row["specifiche_sottotipo_evento"] or 0,
+            row["data"] or "",
+        ),
+    )
+
+
 def _build_anagrafica_row(payload: dict[str, Any], interpreted_json_path: Path) -> dict[str, Any]:
     patient = payload.get("patient", {})
     document = payload.get("document", {})
+    tax_code = patient.get("tax_code")
     return {
         "codice_paziente": _resolve_patient_code(interpreted_json_path, payload),
         "nome": patient.get("given_name"),
         "cognome": patient.get("family_name"),
         "nome_completo": patient.get("full_name"),
-        "codice_fiscale": patient.get("tax_code"),
+        "genere": _derive_gender_from_tax_code(tax_code),
+        "codice_fiscale": tax_code,
         "data_nascita": patient.get("birth_date"),
         "luogo_nascita": patient.get("birth_place"),
         "citta_residenza": patient.get("residence_city"),
         "indirizzo_residenza": patient.get("address_or_residence"),
         "data_rilevamento": document.get("document_snapshot_date"),
     }
+
+
+def _ensure_anagrafiche_schema(conn: sqlite3.Connection) -> None:
+    """Allinea la tabella anagrafiche al layout desiderato, preservando i dati."""
+    desired_columns = [
+        "codice_paziente",
+        "nome",
+        "cognome",
+        "nome_completo",
+        "genere",
+        "codice_fiscale",
+        "data_nascita",
+        "luogo_nascita",
+        "citta_residenza",
+        "indirizzo_residenza",
+        "data_rilevamento",
+    ]
+    existing_columns = [
+        row_info[1]
+        for row_info in conn.execute("PRAGMA table_info(anagrafiche_pazienti)").fetchall()
+    ]
+    if existing_columns == desired_columns:
+        return
+
+    conn.execute(
+        """
+        CREATE TABLE anagrafiche_pazienti_new (
+            codice_paziente TEXT NOT NULL,
+            nome TEXT,
+            cognome TEXT,
+            nome_completo TEXT,
+            genere TEXT,
+            codice_fiscale TEXT,
+            data_nascita TEXT,
+            luogo_nascita TEXT,
+            citta_residenza TEXT,
+            indirizzo_residenza TEXT,
+            data_rilevamento TEXT NOT NULL,
+            UNIQUE (codice_paziente, codice_fiscale, data_rilevamento)
+        )
+        """
+    )
+
+    common_columns = [column for column in desired_columns if column in existing_columns]
+    if common_columns:
+        column_list = ", ".join(common_columns)
+        insert_columns = ", ".join(common_columns)
+        conn.execute(
+            f"""
+            INSERT INTO anagrafiche_pazienti_new ({insert_columns})
+            SELECT {column_list}
+            FROM anagrafiche_pazienti
+            """
+        )
+
+    conn.execute("DROP TABLE anagrafiche_pazienti")
+    conn.execute("ALTER TABLE anagrafiche_pazienti_new RENAME TO anagrafiche_pazienti")
 
 
 def _init_vaccini_db(conn: sqlite3.Connection) -> None:
@@ -245,6 +502,7 @@ def _init_anagrafiche_db(conn: sqlite3.Connection) -> None:
             nome TEXT,
             cognome TEXT,
             nome_completo TEXT,
+            genere TEXT,
             codice_fiscale TEXT,
             data_nascita TEXT,
             luogo_nascita TEXT,
@@ -255,6 +513,7 @@ def _init_anagrafiche_db(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    _ensure_anagrafiche_schema(conn)
 
 
 def _insert_vaccini_rows(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> None:
@@ -289,15 +548,16 @@ def _insert_anagrafica_row(conn: sqlite3.Connection, row: dict[str, Any]) -> Non
     conn.execute(
         """
         INSERT OR REPLACE INTO anagrafiche_pazienti (
-            codice_paziente, nome, cognome, nome_completo, codice_fiscale,
+            codice_paziente, nome, cognome, nome_completo, genere, codice_fiscale,
             data_nascita, luogo_nascita, citta_residenza, indirizzo_residenza, data_rilevamento
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             row["codice_paziente"],
             row["nome"],
             row["cognome"],
             row["nome_completo"],
+            row["genere"],
             row["codice_fiscale"],
             row["data_nascita"],
             row["luogo_nascita"],
@@ -335,9 +595,22 @@ def _register_imported_document(
     )
 
 
+def _delete_document_rows(conn: sqlite3.Connection, source_document: str | None, document_id: str | None) -> None:
+    """Rimuove le righe gia importate per un documento prima di un reimport forzato."""
+    if source_document:
+        conn.execute("DELETE FROM vaccini WHERE origine_documento = ?", (source_document,))
+    elif document_id:
+        conn.execute("DELETE FROM vaccini WHERE document_id = ?", (document_id,))
+    if document_id:
+        conn.execute("DELETE FROM documenti_importati WHERE document_id = ?", (document_id,))
+
+
 def _resolve_requested_interpreted_jsons(args: argparse.Namespace) -> tuple[list[Path], list[str]]:
     artifacts_root = args.artifacts_root.resolve()
     warnings: list[str] = []
+
+    if args.interpreted_json:
+        return [args.interpreted_json.resolve()], warnings
 
     if args.vaccini_all or not args.person:
         if not artifacts_root.exists():
@@ -358,9 +631,10 @@ def _import_single_payload(
     vaccini_conn: sqlite3.Connection,
     anagrafiche_conn: sqlite3.Connection,
     force: bool,
+    utility_dir: Path,
 ) -> tuple[str, str, int, bool]:
     payload = _load_interpreted_json(interpreted_json_path)
-    vaccini_rows = _build_vaccini_rows(payload, interpreted_json_path)
+    vaccini_rows = _build_vaccini_rows(payload, interpreted_json_path, utility_dir)
     anagrafica_row = _build_anagrafica_row(payload, interpreted_json_path)
     document = payload.get("document", {})
     document_id = document.get("document_id") or interpreted_json_path.parent.name
@@ -369,6 +643,7 @@ def _import_single_payload(
     if not force and _document_already_imported(vaccini_conn, document_id):
         return anagrafica_row["codice_paziente"], document_id, 0, True
 
+    _delete_document_rows(vaccini_conn, source_document, document_id)
     _insert_vaccini_rows(vaccini_conn, vaccini_rows)
     _insert_anagrafica_row(anagrafiche_conn, anagrafica_row)
     _register_imported_document(
@@ -397,6 +672,9 @@ def main() -> int:
 
     vaccini_db_path = db_dir / "vaccini.sqlite"
     anagrafiche_db_path = db_dir / "anagrafiche_pazienti.sqlite"
+    utility_dir = args.utility_dir.resolve()
+    utility_dir.mkdir(parents=True, exist_ok=True)
+    vaccini_nomi_tsv_path = _resolve_vaccini_nomi_tsv_path(utility_dir)
 
     vaccini_conn = sqlite3.connect(vaccini_db_path, timeout=30)
     anagrafiche_conn = sqlite3.connect(anagrafiche_db_path, timeout=30)
@@ -430,6 +708,7 @@ def main() -> int:
                 vaccini_conn,
                 anagrafiche_conn,
                 args.force,
+                utility_dir,
             )
             if skipped:
                 skipped_documents += 1
@@ -455,6 +734,7 @@ def main() -> int:
     print(f"-> cartella database: {db_dir}")
     print(f"-> vaccini sqlite: {vaccini_db_path}")
     print(f"-> anagrafiche sqlite: {anagrafiche_db_path}")
+    print(f"-> utility nomi vaccini: {vaccini_nomi_tsv_path}")
     print(f"-> documenti importati: {imported_documents}")
     print(f"-> documenti saltati: {skipped_documents}")
     print(f"-> righe vaccini scritte in questo run: {total_rows}")

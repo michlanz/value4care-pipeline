@@ -1,14 +1,17 @@
-﻿"""Runner standalone per testare solo lo stage 1 della pipeline Value4Care.
+"""Runner standalone per testare lo stage 1 vaccini della pipeline Value4Care.
 
-Questo file si ferma prima del modello.
-Stage 1 qui significa:
-- estrazione testo
-- classificazione e primo tagging
-- estrazione metadati base
-- interpretazione del documento
-- costruzione del primo prompt da passare a stage 2
+Questo file contiene il parser vaccinale strutturale che:
+- individua i documenti vaccinali dal nome file (`vaccin`)
+- estrae il nome vaccino dalla parte sinistra in bold e font piu grande
+- riconosce le dosi come header `numero - data`
+- assegna come note solo il testo non-bold sotto dosi gia riconosciute
 
-I parser dedicati restano confinati qui finche non validiamo il comportamento.
+Gli artifact vengono scritti sotto:
+- artifacts/<person>/<document_id>/
+
+Di default viene scritto solo `interpreted_text.json`.
+Gli artifact di debug vengono prodotti solo con `--debug-artifacts`.
+Il ramo vaccini non genera prompt e non passa per stage 2.
 """
 
 from __future__ import annotations
@@ -29,25 +32,19 @@ if str(SRC_DIR) not in sys.path:
 
 from clinical import DocumentFamily
 from stage1_pdf_reading import classify_document_family, extract_text_from_pdf
-from stage2_llm_runtime import build_document_prompt
 
-DEFAULT_PDF = (
-    ROOT_DIR
-    / "data"
-    / "raw"
-    / "person001"
-    / "CertificatoVaccinale_LMNLCU02E15D918M_20260303104746.pdf"
-)
 DEFAULT_RAW_ROOT = ROOT_DIR / "data" / "raw"
 DEFAULT_ARTIFACTS_ROOT = ROOT_DIR / "artifacts"
-VACCINATION_GLOB = "CertificatoVaccinale*.pdf"
-DATE_RE = re.compile(r"\b\d{2}[/-]\d{2}[/-]\d{2,4}\b")
+
 TAX_CODE_RE = re.compile(r"\b[A-Z]{6}\d{2}[A-Z]\d{2}[A-Z]\d{3}[A-Z]\b")
-UPPER_NAME_RE = re.compile(r"^[A-Z' ]{3,}$")
 DOSE_DATE_RE = re.compile(r"(?P<dose>\d+)\s*-\s*(?P<date>\d{2}[/-]\d{2}[/-]\d{2,4})")
+REGION_RE = re.compile(r"\bREGIONE\s+[A-ZÀ-ÖØ-Ý' ]+\b", re.IGNORECASE)
+
 FOOTER_PREFIXES = (
     "ATS DI ",
-    "VIA DUCA ",
+    "ASST ",
+    "ASL ",
+    "VIA ",
     "P.IVA:",
     "Documento firmato",
     "I dati presenti",
@@ -57,6 +54,11 @@ COMMON_NOISE_PREFIXES = (
     "customerservice.",
     "pagina ",
     "salva fascicolo in pdf",
+)
+VACCINATION_TABLE_END_PREFIXES = (
+    "DATA DI CREAZIONE DEL DOCUMENTO",
+    "DOCUMENTO FIRMATO DIGITALMENTE",
+    "I DATI PRESENTI SONO RESI DISPONIBILI",
 )
 STREET_PREFIX_NORMALIZATION = {
     "V": "VIA",
@@ -72,157 +74,145 @@ STREET_PREFIX_NORMALIZATION = {
     "V.LE": "VIALE",
     "VIALE": "VIALE",
 }
+AUTHORITY_RES = (
+    re.compile(r"\bATS DI\s+[A-ZÀ-ÖØ-Ý' ]+\b", re.IGNORECASE),
+    re.compile(r"\bASST\s+[A-ZÀ-ÖØ-Ý' ]+\b", re.IGNORECASE),
+    re.compile(r"\bASL\s+[A-ZÀ-ÖØ-Ý' ]+\b", re.IGNORECASE),
+)
+
+
+# ---------------------------------------------------------------------------
+# CLI e discovery documenti
+# ---------------------------------------------------------------------------
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Test standalone di stage 1.")
-    parser.add_argument("--pdf", type=Path, default=DEFAULT_PDF, help="PDF da processare.")
+    """Costruisce la CLI di stage 1 per i vaccini."""
+    parser = argparse.ArgumentParser(description="Test standalone di stage 1 solo per i vaccini.")
+    parser.add_argument("--pdf", type=Path, help="Processa esplicitamente un singolo PDF vaccinale.")
     parser.add_argument(
         "--person",
         type=str,
         help=(
-            "Processa il vaccino di una persona cercando automaticamente "
-            "l'unico file che inizia con 'CertificatoVaccinale' nella cartella data/raw/<person>/."
+            "Processa il documento vaccinale di una persona cercando l'unico PDF "
+            "il cui nome contiene 'vaccin' nella cartella data/raw/<person>/."
         ),
     )
+    parser.add_argument("--force", action="store_true", help="Riesegue stage1 anche se il JSON esiste gia.")
     parser.add_argument(
-        "--vaccini-all",
+        "--debug-artifacts",
+        dest="debug_artifacts",
         action="store_true",
-        help=(
-            "Cicla su tutte le cartelle person* sotto data/raw e cerca in ciascuna "
-            "l'unico CertificatoVaccinale*.pdf."
-        ),
+        help="Scrive anche gli artifact di debug oltre al JSON interpretato.",
     )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Abilita artefatti di debug aggiuntivi anche per documenti non vaccinali.",
-    )
-    parser.add_argument(
-        "--raw-root",
-        type=Path,
-        default=DEFAULT_RAW_ROOT,
-        help="Root dei documenti grezzi organizzati per persona.",
-    )
+    parser.add_argument("--debug", dest="debug_artifacts", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--raw-root", type=Path, default=DEFAULT_RAW_ROOT, help="Root dei documenti grezzi.")
     parser.add_argument(
         "--artifacts-root",
         type=Path,
         default=DEFAULT_ARTIFACTS_ROOT,
-        help="Directory root degli artefatti per paziente/documento.",
+        help="Root degli artifact di stage 1.",
     )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Riesegue stage1 anche se gli artefatti standard esistono gia.",
-    )
+    parser.set_defaults(debug_artifacts=False)
     return parser
 
 
 def _artifact_paths(document_root: Path) -> dict[str, Path]:
+    """Restituisce i path standard degli artifact del documento."""
     return {
         "document_dir": document_root,
+        "interpreted_json": document_root / "interpreted_text.json",
         "extracted_text": document_root / "extracted_text.txt",
         "interpreted_text": document_root / "interpreted_text.txt",
-        "interpreted_json": document_root / "interpreted_text.json",
-        "prompt_main": document_root / "prompt_main.txt",
         "layout_text": document_root / "layout_text.txt",
         "layout_words": document_root / "layout_words.json",
+        "grid_debug": document_root / "grid_debug.json",
         "reader_text": document_root / "reader_text.txt",
         "reader_json": document_root / "reader.json",
     }
 
 
 def _resolve_document_artifact_dir(pdf_path: Path, artifacts_root: Path) -> Path:
+    """Mappa un PDF nel path artifact di stage 1."""
     person_id = pdf_path.parent.name if pdf_path.parent.name.startswith("person") else "person_unknown"
-    document_id = pdf_path.stem
-    return artifacts_root / person_id / document_id
+    return artifacts_root / person_id / pdf_path.stem
+
+
+def _looks_like_vaccination_pdf(path: Path) -> bool:
+    """Riconosce i documenti vaccinali dal nome file."""
+    return path.is_file() and path.suffix.lower() == ".pdf" and "vaccin" in path.name.casefold()
 
 
 def _find_unique_vaccination_pdf(person_dir: Path) -> Path | None:
-    matches = sorted(path for path in person_dir.glob(VACCINATION_GLOB) if path.is_file())
-    if len(matches) == 1:
-        return matches[0]
-    return None
+    """Restituisce l'unico PDF vaccinale della cartella paziente, se esiste."""
+    matches = sorted(path for path in person_dir.iterdir() if _looks_like_vaccination_pdf(path))
+    return matches[0] if len(matches) == 1 else None
 
 
 def _discover_vaccination_pdfs(raw_root: Path) -> tuple[list[Path], list[str]]:
+    """Scansiona tutte le persone e raccoglie i PDF vaccinali validi."""
     pdfs: list[Path] = []
     warnings: list[str] = []
+
     for person_dir in sorted(path for path in raw_root.iterdir() if path.is_dir() and path.name.startswith("person")):
-        matches = sorted(path for path in person_dir.glob(VACCINATION_GLOB) if path.is_file())
+        matches = sorted(path for path in person_dir.iterdir() if _looks_like_vaccination_pdf(path))
         if len(matches) == 1:
             pdfs.append(matches[0])
-            continue
-        if not matches:
-            warnings.append(f"{person_dir.name}: nessun {VACCINATION_GLOB} trovato")
+        elif not matches:
+            warnings.append(f"{person_dir.name}: nessun PDF vaccinale trovato")
         else:
-            warnings.append(
-                f"{person_dir.name}: trovati {len(matches)} file {VACCINATION_GLOB}, serve un solo certificato vaccinale"
-            )
+            joined = ", ".join(path.name for path in matches)
+            warnings.append(f"ERRORE {person_dir.name}: trovati piu documenti vaccini: {joined}")
     return pdfs, warnings
 
 
-def _has_stage1_outputs(document_root: Path) -> bool:
-    standard_paths = _artifact_paths(document_root)
-    required = (
-        standard_paths["extracted_text"],
-        standard_paths["interpreted_text"],
-        standard_paths["interpreted_json"],
-        standard_paths["prompt_main"],
-    )
-    return all(path.exists() for path in required)
+def _resolve_requested_pdfs(args: argparse.Namespace) -> tuple[list[Path], list[str]]:
+    """Risolve i PDF da processare a partire dagli argomenti CLI."""
+    if args.pdf:
+        return [args.pdf.resolve()], []
+
+    raw_root = args.raw_root.resolve()
+    if not raw_root.exists():
+        return [], [f"root documenti non trovata: {raw_root}"]
+
+    if args.person:
+        person_dir = raw_root / args.person
+        if not person_dir.exists():
+            return [], [f"cartella paziente non trovata: {person_dir}"]
+        pdf_path = _find_unique_vaccination_pdf(person_dir)
+        if pdf_path is not None:
+            return [pdf_path], []
+
+        matches = sorted(path.name for path in person_dir.iterdir() if _looks_like_vaccination_pdf(path))
+        if not matches:
+            return [], [f"{args.person}: nessun PDF vaccinale trovato"]
+        return [], [f"ERRORE {args.person}: trovati piu documenti vaccini: {', '.join(matches)}"]
+
+    return _discover_vaccination_pdfs(raw_root)
 
 
-def _extract_filename_snapshot_date(pdf_path: Path) -> str | None:
-    match = re.search(r"_(\d{8})(?:\d{6})?(?:_|\.pdf$)", pdf_path.name)
-    if not match:
-        return None
-    raw = match.group(1)
-    return f"{raw[0:4]}-{raw[4:6]}-{raw[6:8]}"
+def _has_stage1_output(document_root: Path) -> bool:
+    """Controlla se il JSON interpretato esiste gia."""
+    return _artifact_paths(document_root)["interpreted_json"].exists()
 
 
-def _normalize_street_prefix(address: str) -> str:
-    cleaned = re.sub(r"\s+", " ", address).strip(" -")
-    if not cleaned:
-        return cleaned
-    parts = cleaned.split(" ", 1)
-    prefix = parts[0].upper()
-    normalized_prefix = STREET_PREFIX_NORMALIZATION.get(prefix, prefix)
-    if len(parts) == 1:
-        return normalized_prefix
-    return f"{normalized_prefix} {parts[1]}".strip()
+# ---------------------------------------------------------------------------
+# Primitive testo/layout
+# ---------------------------------------------------------------------------
 
 
-def _normalize_date(raw: str) -> str:
-    parts = re.split(r"[/-]", raw)
-    if len(parts) != 3:
-        return raw
-    day, month, year = parts
-    if len(year) == 2:
-        year = f"20{year}" if int(year) <= 30 else f"19{year}"
-    return f"{year}-{month}-{day}"
-
-
-def _dedupe_preserve_order(items: list[Any]) -> list[Any]:
-    seen: set[str] = set()
-    output: list[Any] = []
-    for item in items:
-        key = json.dumps(item, ensure_ascii=False, sort_keys=True) if isinstance(item, (dict, list)) else str(item)
-        if key in seen:
-            continue
-        seen.add(key)
-        output.append(item)
-    return output
+def _normalize_text(text: str) -> str:
+    """Normalizza spazi multipli e trimming."""
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _words_to_text(words: list[dict[str, Any]]) -> str:
+    """Concatena le word nell'ordine corrente."""
     return " ".join(str(word["text"]) for word in words).strip()
 
 
-def _group_words_into_lines(
-    words: list[dict[str, Any]],
-    line_tolerance: float = 4.0,
-) -> list[dict[str, Any]]:
+def _group_words_into_lines(words: list[dict[str, Any]], line_tolerance: float = 4.0) -> list[dict[str, Any]]:
+    """Raggruppa le word del PDF in righe geometriche."""
     rows: list[dict[str, Any]] = []
     for word in sorted(words, key=lambda item: (float(item["top"]), float(item["x0"]))):
         top = float(word["top"])
@@ -233,63 +223,219 @@ def _group_words_into_lines(
     return rows
 
 
-def _group_line_words_into_blocks(
-    words: list[dict[str, Any]],
-    block_gap_threshold: float = 18.0,
-) -> list[dict[str, Any]]:
+def _build_block_from_words(words: list[dict[str, Any]]) -> dict[str, Any]:
+    """Costruisce un blocco geometrico a partire da una lista di word."""
+    x0 = min(float(word["x0"]) for word in words)
+    x1 = max(float(word["x1"]) for word in words)
+    top = min(float(word["top"]) for word in words)
+    bottom = max(float(word["bottom"]) for word in words)
+    return {
+        "x0": round(x0, 1),
+        "x1": round(x1, 1),
+        "center_x": round((x0 + x1) / 2, 1),
+        "top": round(top, 1),
+        "bottom": round(bottom, 1),
+        "text": _words_to_text(words),
+        "words": [
+            {
+                "text": str(word["text"]),
+                "x0": round(float(word["x0"]), 1),
+                "x1": round(float(word["x1"]), 1),
+                "top": round(float(word["top"]), 1),
+                "bottom": round(float(word["bottom"]), 1),
+                "fontname": str(word.get("fontname") or ""),
+                "size": round(float(word.get("size", 0.0)), 2),
+            }
+            for word in words
+        ],
+    }
+
+
+def _split_block_on_inline_dose_header(block: dict[str, Any]) -> list[dict[str, Any]]:
+    """Separa i blocchi misti `testo ... dose-data` in due blocchi distinti."""
+    words = list(block.get("words") or [])
+    if len(words) < 3:
+        return [block]
+
+    normalized_words = [str(word["text"]).strip() for word in words]
+    for split_index in range(1, len(normalized_words)):
+        right_text = " ".join(normalized_words[split_index:]).strip()
+        if DOSE_DATE_RE.match(right_text):
+            return [
+                _build_block_from_words(words[:split_index]),
+                _build_block_from_words(words[split_index:]),
+            ]
+    return [block]
+
+
+def _group_line_words_into_blocks(words: list[dict[str, Any]], block_gap_threshold: float = 18.0) -> list[dict[str, Any]]:
+    """Raggruppa le word di una riga in blocchi orizzontali."""
     sorted_words = sorted(words, key=lambda item: float(item["x0"]))
     if not sorted_words:
         return []
 
-    grouped_blocks: list[list[dict[str, Any]]] = [[sorted_words[0]]]
+    grouped: list[list[dict[str, Any]]] = [[sorted_words[0]]]
     last_x1 = float(sorted_words[0]["x1"])
     for word in sorted_words[1:]:
         gap = float(word["x0"]) - last_x1
         if gap > block_gap_threshold:
-            grouped_blocks.append([word])
+            grouped.append([word])
         else:
-            grouped_blocks[-1].append(word)
+            grouped[-1].append(word)
         last_x1 = float(word["x1"])
 
-    blocks: list[dict[str, Any]] = []
-    for block_words in grouped_blocks:
-        x0 = min(float(word["x0"]) for word in block_words)
-        x1 = max(float(word["x1"]) for word in block_words)
-        blocks.append(
-            {
-                "x0": round(x0, 1),
-                "x1": round(x1, 1),
-                "center_x": round((x0 + x1) / 2, 1),
-                "text": _words_to_text(block_words),
-                "words": [
-                    {
-                        "text": str(word["text"]),
-                        "x0": round(float(word["x0"]), 1),
-                        "x1": round(float(word["x1"]), 1),
-                        "top": round(float(word["top"]), 1),
-                        "bottom": round(float(word["bottom"]), 1),
-                    }
-                    for word in block_words
-                ],
-            }
-        )
-    return blocks
+    blocks = [_build_block_from_words(group) for group in grouped]
+    refined: list[dict[str, Any]] = []
+    for block in blocks:
+        refined.extend(_split_block_on_inline_dose_header(block))
+    return refined
 
 
 def _render_line_from_blocks(blocks: list[dict[str, Any]]) -> str:
+    """Rende una riga leggibile dai blocchi ordinati."""
     return "\t".join(block["text"] for block in blocks if block["text"]).strip()
 
 
-def _dose_sort_key(dose_column: dict[str, Any]) -> tuple[int, str, float]:
-    raw_dose = str(dose_column.get("dose_number") or "")
-    try:
-        dose_number = int(raw_dose)
-    except ValueError:
-        dose_number = 9999
-    return (dose_number, str(dose_column.get("date") or ""), float(dose_column.get("center_x") or 0.0))
+def _clone_line_with_blocks(line: dict[str, Any], blocks: list[dict[str, Any]], text_override: str | None = None) -> dict[str, Any]:
+    """Clona una riga sostituendo il sottoinsieme di blocchi rilevante."""
+    return {
+        **line,
+        "text": text_override if text_override is not None else _render_line_from_blocks(blocks),
+        "blocks": list(blocks),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tipografia e parsing righe vaccinali
+# ---------------------------------------------------------------------------
+
+
+def _word_is_bold(word: dict[str, Any]) -> bool:
+    """Riconosce le word in bold dal nome font."""
+    return "bold" in str(word.get("fontname") or "").casefold()
+
+
+def _block_is_bold(block: dict[str, Any]) -> bool:
+    """Classifica un blocco come bold se la maggioranza delle word e bold."""
+    words = list(block.get("words") or [])
+    if not words:
+        return False
+    bold_count = sum(1 for word in words if _word_is_bold(word))
+    return bold_count >= max(1, len(words) // 2)
+
+
+def _block_text_matches_dose_header(block: dict[str, Any]) -> bool:
+    """Controlla se un blocco e un header dose-data puro."""
+    return bool(DOSE_DATE_RE.fullmatch(_normalize_text(str(block.get("text") or ""))))
+
+
+def _extract_name_fragment_from_blocks(blocks: list[dict[str, Any]]) -> str | None:
+    """Estrae il frammento di nome vaccino dalla zona sinistra della riga."""
+    words: list[dict[str, Any]] = []
+    for block in blocks:
+        words.extend(list(block.get("words") or []))
+    if not words:
+        return None
+
+    bold_words = [word for word in words if _word_is_bold(word)]
+    if not bold_words:
+        return None
+
+    max_size = max(float(word.get("size", 0.0)) for word in bold_words)
+    size_threshold = max_size - 0.35
+    selected = [
+        word
+        for word in words
+        if _word_is_bold(word) and float(word.get("size", 0.0)) >= size_threshold
+    ]
+    return _normalize_text(_words_to_text(selected)) or None
+
+
+def _partition_blocks_by_boundary(blocks: list[dict[str, Any]], boundary_x: float) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Divide i blocchi in parole a sinistra/destra di un confine X."""
+    left_blocks: list[dict[str, Any]] = []
+    right_blocks: list[dict[str, Any]] = []
+
+    for block in blocks:
+        words = list(block.get("words") or [])
+        if not words:
+            continue
+
+        left_words = [word for word in words if float(word.get("x1", 0.0)) <= boundary_x]
+        right_words = [word for word in words if float(word.get("x0", 0.0)) > boundary_x]
+
+        if left_words:
+            left_blocks.append(_build_block_from_words(left_words))
+        if right_words:
+            right_blocks.append(_build_block_from_words(right_words))
+
+    return left_blocks, right_blocks
+
+
+def _find_body_start_index(lines: list[dict[str, Any]]) -> int | None:
+    """Trova l'inizio del corpo tabellare vaccinale nella pagina."""
+    for index, line in enumerate(lines):
+        if "HA EFFETTUATO LE SEGUENTI VACCINAZIONI" in str(line.get("text") or "").upper():
+            return index + 1
+    for index, line in enumerate(lines):
+        if any(_block_is_bold(block) and _block_text_matches_dose_header(block) for block in line.get("blocks", [])):
+            return index
+    return None
+
+
+def _is_vaccination_table_end_line(line: dict[str, Any] | str) -> bool:
+    """Riconosce il blocco note che segue la tabella vaccinale finale."""
+    raw_text = line if isinstance(line, str) else str(line.get("text") or "")
+    normalized = _normalize_text(raw_text).upper()
+    return any(normalized.startswith(prefix) for prefix in VACCINATION_TABLE_END_PREFIXES)
+
+
+def _iter_vaccination_body_lines(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Restituisce solo le righe del corpo vaccinale, scartando header/footer."""
+    flattened: list[dict[str, Any]] = []
+    table_ended = False
+    for page in pages:
+        if table_ended:
+            break
+        lines = page.get("lines", [])
+        start_index = _find_body_start_index(lines)
+        if start_index is None:
+            continue
+        for line in lines[start_index:]:
+            if _is_vaccination_table_end_line(line):
+                table_ended = True
+                break
+            if _is_common_noise_line(line) or _is_footer_line(line):
+                continue
+            flattened.append(line)
+    return flattened
+
+
+def _extract_dose_columns_from_blocks(blocks: list[dict[str, Any]], page_number: int, source_kind: str) -> list[dict[str, Any]]:
+    """Converte i blocchi header dose in strutture dose_columns."""
+    columns: list[dict[str, Any]] = []
+    for block in blocks:
+        header_text = _normalize_text(str(block.get("text") or ""))
+        match = DOSE_DATE_RE.fullmatch(header_text)
+        if not match:
+            continue
+        columns.append(
+            {
+                "header_text": header_text,
+                "dose_number": match.group("dose"),
+                "date": match.group("date"),
+                "x0": block["x0"],
+                "x1": block["x1"],
+                "center_x": block["center_x"],
+                "source_kind": source_kind,
+                "source_page_number": page_number,
+            }
+        )
+    return columns
 
 
 def _build_dose_zones(dose_columns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Costruisce le zone orizzontali di assegnazione dei dettagli dose."""
     sorted_columns = sorted(dose_columns, key=lambda column: float(column["center_x"]))
     for index, column in enumerate(sorted_columns):
         if index == 0:
@@ -309,49 +455,11 @@ def _build_dose_zones(dose_columns: list[dict[str, Any]]) -> list[dict[str, Any]
     return sorted_columns
 
 
-def _extract_dose_columns_from_line(line: dict[str, Any]) -> list[dict[str, Any]]:
-    dose_columns: list[dict[str, Any]] = []
-    for block in line["blocks"]:
-        block_text = str(block["text"])
-        matches = list(DOSE_DATE_RE.finditer(block_text))
-        for match in matches:
-            dose_columns.append(
-                {
-                    "header_text": match.group(0),
-                    "dose_number": match.group("dose"),
-                    "date": match.group("date"),
-                    "x0": block["x0"],
-                    "x1": block["x1"],
-                    "center_x": block["center_x"],
-                }
-            )
-    return dose_columns
-
-
-def _is_dose_only_header_line(line: dict[str, Any]) -> bool:
-    if not line.get("blocks"):
-        return False
-    has_dose = False
-    for block in line["blocks"]:
-        block_text = str(block["text"]).strip()
-        if not block_text:
-            continue
-        full_matches = list(DOSE_DATE_RE.finditer(block_text))
-        if not full_matches:
-            return False
-        rebuilt = " ".join(match.group(0) for match in full_matches).strip()
-        normalized = re.sub(r"\s+", " ", block_text)
-        if rebuilt != normalized:
-            return False
-        has_dose = True
-    return has_dose
-
-
 def _merge_section_dose_columns(current_section: dict[str, Any], new_columns: list[dict[str, Any]]) -> None:
-    existing = list(current_section.get("dose_columns", []))
+    """Aggiunge nuove dosi a una sezione gia aperta senza duplicarle."""
     merged: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
-    for column in existing + new_columns:
+    for column in list(current_section.get("dose_columns", [])) + new_columns:
         key = (str(column.get("dose_number") or ""), str(column.get("date") or ""))
         if key in seen:
             continue
@@ -360,90 +468,36 @@ def _merge_section_dose_columns(current_section: dict[str, Any], new_columns: li
     current_section["dose_columns"] = _build_dose_zones(merged)
 
 
-def _is_label_only_header_line(line: dict[str, Any], current_section: dict[str, Any]) -> bool:
-    blocks = line.get("blocks") or []
-    if len(blocks) != 1:
-        return False
-
-    normalized = re.sub(r"\s+", " ", str(line.get("text") or "").strip())
-    if not normalized:
-        return False
-    if DOSE_DATE_RE.search(normalized) or any(char.isdigit() for char in normalized):
-        return False
-    if normalized != normalized.upper():
-        return False
-
-    tokens = normalized.split()
-    if len(tokens) < 2 or len(tokens) > 4:
-        return False
-
-    forbidden_fragments = (
-        "*",
-        "+",
-        "ML",
-        "SIR",
-        "FL",
-        "AGHI",
-        "INIETT",
-        "CONC",
-        "DOSI",
-        "SOLVENTE",
-        "POLVERE",
-        "VACCINE",
-        "COVID",
-    )
-    if any(fragment in normalized for fragment in forbidden_fragments):
-        return False
-
-    dose_columns = current_section.get("dose_columns", [])
-    if not dose_columns:
-        return False
-
-    leftmost_zone = min(float(column.get("zone_left", column.get("x0", 0.0))) for column in dose_columns)
-    block = blocks[0]
-    block_right = float(block.get("x1", 0.0))
-    return block_right <= leftmost_zone - 8.0
-
-
-def _append_label_continuation(current_section: dict[str, Any], line_text: str) -> None:
-    normalized = re.sub(r"\s+", " ", line_text.strip())
+def _append_label_continuation(current_section: dict[str, Any], line: dict[str, Any]) -> None:
+    """Appende una continuation del nome vaccino a una sezione aperta."""
+    normalized = _normalize_text(str(line["text"]))
     if not normalized:
         return
-    current_section.setdefault("label_continuation_lines", []).append(normalized)
-    base_label = str(current_section.get("vaccine_label") or "").strip()
-    current_section["vaccine_label"] = f"{base_label} {normalized}".strip()
+    current_section["vaccine_label_raw_lines"].append(normalized)
+    current_section["label_continuation_lines"].append(normalized)
+    current_section["name_wrapped"] = True
+    if line["page_number"] != current_section["last_page_number"]:
+        current_section["page_wrapped"] = True
+    current_section["last_page_number"] = line["page_number"]
 
 
-def _parse_vaccine_header(line: dict[str, Any]) -> dict[str, Any] | None:
-    vaccine_label_parts: list[str] = []
-    seen_first_dose = False
-    dose_columns = _extract_dose_columns_from_line(line)
-
-    for block in line["blocks"]:
-        block_text = str(block["text"])
-        matches = list(DOSE_DATE_RE.finditer(block_text))
-        if not matches:
-            if not seen_first_dose:
-                vaccine_label_parts.append(block_text)
-            continue
-
-        prefix = block_text[: matches[0].start()].strip()
-        if prefix and not seen_first_dose:
-            vaccine_label_parts.append(prefix)
-
-        seen_first_dose = True
-
-    vaccine_label = " ".join(part for part in vaccine_label_parts if part).strip(" -")
-    if vaccine_label and dose_columns:
-        return {"vaccine_label": vaccine_label, "dose_columns": _build_dose_zones(dose_columns)}
-    return None
+def _dose_sort_key(dose_column: dict[str, Any]) -> tuple[int, str, float]:
+    """Ordina le dosi per numero crescente, poi data e posizione."""
+    raw_dose = str(dose_column.get("dose_number") or "")
+    try:
+        dose_number = int(raw_dose)
+    except ValueError:
+        dose_number = 9999
+    return (dose_number, str(dose_column.get("date") or ""), float(dose_column.get("center_x") or 0.0))
 
 
 def _overlap_length(start_a: float, end_a: float, start_b: float, end_b: float) -> float:
+    """Calcola la lunghezza di overlap tra due segmenti orizzontali."""
     return max(0.0, min(end_a, end_b) - max(start_a, start_b))
 
 
 def _classify_block_to_doses(block: dict[str, Any], dose_columns: list[dict[str, Any]]) -> dict[str, Any]:
+    """Assegna un blocco di dettaglio alla dose piu probabile."""
     block_left = float(block["x0"])
     block_right = float(block["x1"])
     block_width = max(1.0, block_right - block_left)
@@ -468,7 +522,6 @@ def _classify_block_to_doses(block: dict[str, Any], dose_columns: list[dict[str,
 
     overlapping = [candidate for candidate in candidates if candidate["overlap"] > 0]
     overlapping.sort(key=lambda candidate: (-candidate["overlap_ratio"], candidate["center_distance"]))
-
     if len(overlapping) == 1:
         chosen = overlapping[0]
         return {
@@ -478,22 +531,8 @@ def _classify_block_to_doses(block: dict[str, Any], dose_columns: list[dict[str,
             "assigned_dose_date": chosen["date"],
             "candidate_doses": overlapping,
         }
-
     if len(overlapping) > 1:
         chosen = overlapping[0]
-        secondary = overlapping[1]
-        if (
-            float(chosen["overlap_ratio"]) >= 0.9
-            and float(secondary["overlap_ratio"]) <= 0.1
-            and float(chosen["center_distance"]) < float(secondary["center_distance"])
-        ):
-            return {
-                "assignment_mode": "exact",
-                "assigned_dose_header": chosen["header_text"],
-                "assigned_dose_number": chosen["dose_number"],
-                "assigned_dose_date": chosen["date"],
-                "candidate_doses": overlapping,
-            }
         return {
             "assignment_mode": "ambiguous_multi_column",
             "assigned_dose_header": chosen["header_text"],
@@ -513,86 +552,196 @@ def _classify_block_to_doses(block: dict[str, Any], dose_columns: list[dict[str,
     }
 
 
-def _extract_vaccine_sections(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _label_needs_review(vaccine_label: str) -> bool:
+    """Segnala i label palesemente incompleti."""
+    normalized = _normalize_text(vaccine_label)
+    return not normalized or normalized.endswith("-") or normalized.endswith("/")
+
+
+def _finalize_section(section: dict[str, Any]) -> dict[str, Any]:
+    """Chiude una sezione vaccinale e costruisce il payload finale."""
+    dose_columns = sorted(_build_dose_zones(list(section.get("dose_columns", []))), key=_dose_sort_key)
+    vaccine_label = _normalize_text(" ".join(section.get("vaccine_label_raw_lines", [])))
+
+    detail_lines = list(section.get("detail_lines", []))
+    doses: list[dict[str, Any]] = []
+    for dose_column in dose_columns:
+        exact_blocks: list[dict[str, Any]] = []
+        ambiguous_blocks: list[dict[str, Any]] = []
+        for detail_line in detail_lines:
+            for block in detail_line.get("blocks", []):
+                assignment = _classify_block_to_doses(block, dose_columns)
+                if assignment.get("assigned_dose_number") != dose_column.get("dose_number"):
+                    continue
+                payload = {
+                    "text": block.get("text"),
+                    "assignment_mode": assignment.get("assignment_mode"),
+                    "candidate_doses": assignment.get("candidate_doses", []),
+                }
+                if assignment.get("assignment_mode") == "exact":
+                    exact_blocks.append(payload)
+                else:
+                    ambiguous_blocks.append(payload)
+
+        if exact_blocks and not ambiguous_blocks:
+            confidence = "high"
+        elif exact_blocks or ambiguous_blocks:
+            confidence = "low"
+        else:
+            confidence = "missing_details"
+
+        doses.append(
+            {
+                "dose_number": dose_column.get("dose_number"),
+                "date": dose_column.get("date"),
+                "header_text": dose_column.get("header_text"),
+                "source_kind": dose_column.get("source_kind"),
+                "source_page_number": dose_column.get("source_page_number"),
+                "confidence": confidence,
+                "exact_detail_texts": [block["text"] for block in exact_blocks],
+                "ambiguous_detail_blocks": ambiguous_blocks,
+            }
+        )
+
+    return {
+        "page_number": section.get("first_page_number"),
+        "last_page_number": section.get("last_page_number"),
+        "vaccine_label_raw_lines": section.get("vaccine_label_raw_lines", []),
+        "vaccine_label": vaccine_label,
+        "header_line_text": section.get("header_line_text"),
+        "header_continuation_lines": section.get("header_continuation_lines", []),
+        "label_continuation_lines": section.get("label_continuation_lines", []),
+        "name_wrapped": bool(section.get("name_wrapped")),
+        "dose_wrapped": bool(section.get("dose_wrapped")),
+        "page_wrapped": bool(section.get("page_wrapped")),
+        "label_needs_review": _label_needs_review(vaccine_label),
+        "doses": sorted(doses, key=_dose_sort_key),
+    }
+
+
+def _extract_vaccine_sections_from_rows(pages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Esegue il parsing principale del corpo vaccinale riga per riga."""
     sections: list[dict[str, Any]] = []
     current_section: dict[str, Any] | None = None
+    row_debug: list[dict[str, Any]] = []
 
-    for line in lines:
-        line_text = str(line["text"])
-        if any(line_text.startswith(prefix) for prefix in FOOTER_PREFIXES):
-            if current_section is not None:
-                sections.append(current_section)
-                current_section = None
+    for line in _iter_vaccination_body_lines(pages):
+        blocks = list(line.get("blocks") or [])
+        if not blocks:
             continue
 
-        header = _parse_vaccine_header(line)
-        if header is not None:
-            if current_section is not None:
-                sections.append(current_section)
-            current_section = {
-                "vaccine_label": header["vaccine_label"],
-                "header_line_text": line_text,
-                "header_continuation_lines": [],
-                "label_continuation_lines": [],
-                "dose_columns": header["dose_columns"],
-                "detail_lines": [],
+        dose_blocks = [block for block in blocks if _block_is_bold(block) and _block_text_matches_dose_header(block)]
+        first_dose_x0 = min((float(block["x0"]) for block in dose_blocks), default=None)
+
+        if first_dose_x0 is not None:
+            left_blocks, right_remainder_blocks = _partition_blocks_by_boundary(
+                [block for block in blocks if block not in dose_blocks],
+                first_dose_x0 - 4.0,
+            )
+        elif current_section and current_section.get("dose_columns"):
+            boundary_x = min(float(column["x0"]) for column in current_section["dose_columns"]) - 4.0
+            left_blocks, right_remainder_blocks = _partition_blocks_by_boundary(blocks, boundary_x)
+        else:
+            left_blocks, right_remainder_blocks = list(blocks), []
+
+        label_text = _extract_name_fragment_from_blocks(left_blocks)
+        note_blocks = [block for block in right_remainder_blocks if not _block_is_bold(block)]
+        row_debug.append(
+            {
+                "page_number": line["page_number"],
+                "text": line["text"],
+                "label_text": label_text,
+                "dose_headers": [_normalize_text(str(block["text"])) for block in dose_blocks],
+                "non_bold_note_blocks": [_normalize_text(str(block["text"])) for block in note_blocks],
             }
+        )
+
+        if dose_blocks:
+            source_kind = "inline_header"
+            if current_section is not None and not label_text:
+                source_kind = "page_continuation" if line["page_number"] != current_section["last_page_number"] else "line_continuation"
+            row_dose_columns = _extract_dose_columns_from_blocks(dose_blocks, line["page_number"], source_kind=source_kind)
+
+            if label_text:
+                if current_section is not None:
+                    sections.append(_finalize_section(current_section))
+                current_section = {
+                    "vaccine_label_raw_lines": [label_text],
+                    "header_line_text": line["text"],
+                    "header_continuation_lines": [],
+                    "label_continuation_lines": [],
+                    "dose_columns": _build_dose_zones(row_dose_columns),
+                    "detail_lines": [],
+                    "name_wrapped": False,
+                    "dose_wrapped": False,
+                    "page_wrapped": False,
+                    "first_page_number": line["page_number"],
+                    "last_page_number": line["page_number"],
+                }
+            elif current_section is not None:
+                _merge_section_dose_columns(current_section, row_dose_columns)
+                current_section["header_continuation_lines"].append(_render_line_from_blocks(dose_blocks))
+                current_section["dose_wrapped"] = True
+                if line["page_number"] != current_section["last_page_number"]:
+                    current_section["page_wrapped"] = True
+                current_section["last_page_number"] = line["page_number"]
+            else:
+                continue
+
+            if current_section is not None and note_blocks:
+                current_section["detail_lines"].append(_clone_line_with_blocks(line, note_blocks))
+                current_section["last_page_number"] = line["page_number"]
             continue
 
         if current_section is None:
             continue
 
-        if _is_label_only_header_line(line, current_section):
-            _append_label_continuation(current_section, line_text)
-            continue
+        appended = False
+        if label_text:
+            _append_label_continuation(current_section, _clone_line_with_blocks(line, left_blocks, text_override=label_text))
+            appended = True
 
-        if _is_dose_only_header_line(line):
-            continuation_columns = _extract_dose_columns_from_line(line)
-            if continuation_columns:
-                _merge_section_dose_columns(current_section, continuation_columns)
-                current_section.setdefault("header_continuation_lines", []).append(line_text)
-                continue
+        continuation_note_blocks = [block for block in right_remainder_blocks if not _block_is_bold(block)]
+        if not continuation_note_blocks and not label_text:
+            continuation_note_blocks = [block for block in blocks if not _block_is_bold(block)]
+        if continuation_note_blocks:
+            current_section["detail_lines"].append(_clone_line_with_blocks(line, continuation_note_blocks))
+            appended = True
 
-        detail_blocks: list[dict[str, Any]] = []
-        for block in line["blocks"]:
-            assignment = _classify_block_to_doses(block, current_section["dose_columns"])
-            detail_blocks.append(
-                {
-                    "text": block["text"],
-                    "x0": block["x0"],
-                    "x1": block["x1"],
-                    "assignment_mode": assignment["assignment_mode"],
-                    "assigned_dose_header": assignment["assigned_dose_header"],
-                    "assigned_dose_number": assignment["assigned_dose_number"],
-                    "assigned_dose_date": assignment["assigned_dose_date"],
-                    "candidate_doses": assignment["candidate_doses"],
-                }
-            )
-
-        if detail_blocks:
-            current_section["detail_lines"].append({"text": line_text, "blocks": detail_blocks})
+        if appended and line["page_number"] != current_section["last_page_number"]:
+            current_section["page_wrapped"] = True
+        if appended:
+            current_section["last_page_number"] = line["page_number"]
 
     if current_section is not None:
-        sections.append(current_section)
-    return sections
+        sections.append(_finalize_section(current_section))
+
+    return sections, {"parser": "row_column_v1", "rows": row_debug}
 
 
-def _reader_confidence_from_blocks(blocks: list[dict[str, Any]]) -> str:
-    if not blocks:
-        return "missing_details"
-    modes = {str(block["assignment_mode"]) for block in blocks}
-    if modes == {"exact"}:
-        return "high"
-    if "ambiguous_multi_column" in modes or "nearest_only" in modes:
-        return "low"
-    return "medium"
+# ---------------------------------------------------------------------------
+# Estrazione layout e reader tecnico
+# ---------------------------------------------------------------------------
 
 
-def _extract_layout_artifact(path: Path) -> dict[str, Any]:
+def _is_footer_line(line: dict[str, Any]) -> bool:
+    """Riconosce le righe footer/istituzionali del certificato."""
+    text = str(line["text"]).strip()
+    return any(text.startswith(prefix) for prefix in FOOTER_PREFIXES)
+
+
+def _is_common_noise_line(line: dict[str, Any]) -> bool:
+    """Riconosce le righe di rumore comuni dei PDF esportati."""
+    text = _normalize_text(str(line["text"]).lower())
+    return any(text.startswith(prefix) for prefix in COMMON_NOISE_PREFIXES)
+
+
+def _build_layout_artifact(path: Path) -> dict[str, Any]:
+    """Estrae il layout PDF e costruisce le sezioni vaccinali."""
     pages: list[dict[str, Any]] = []
     with pdfplumber.open(path) as pdf:
         for page_number, page in enumerate(pdf.pages, start=1):
-            raw_words = page.extract_words(use_text_flow=False, keep_blank_chars=False)
+            raw_words = page.extract_words(use_text_flow=False, keep_blank_chars=False, extra_attrs=["fontname", "size"])
             raw_lines = _group_words_into_lines(raw_words)
             lines: list[dict[str, Any]] = []
             for raw_line in raw_lines:
@@ -600,7 +749,17 @@ def _extract_layout_artifact(path: Path) -> dict[str, Any]:
                 line_text = _render_line_from_blocks(blocks)
                 if not line_text:
                     continue
-                lines.append({"top": round(float(raw_line["top"]), 1), "text": line_text, "blocks": blocks})
+                top = min(float(block["top"]) for block in blocks)
+                bottom = max(float(block["bottom"]) for block in blocks)
+                lines.append(
+                    {
+                        "page_number": page_number,
+                        "top": round(top, 1),
+                        "bottom": round(bottom, 1),
+                        "text": line_text,
+                        "blocks": blocks,
+                    }
+                )
 
             pages.append(
                 {
@@ -609,71 +768,35 @@ def _extract_layout_artifact(path: Path) -> dict[str, Any]:
                     "height": round(float(page.height), 1),
                     "text": "\n".join(line["text"] for line in lines).strip(),
                     "lines": lines,
-                    "vaccine_sections": _extract_vaccine_sections(lines),
                 }
             )
 
+    text = "\n\n".join(page["text"] for page in pages if page["text"]).strip()
+    vaccination_sections, grid_debug = _extract_vaccine_sections_from_rows(pages)
     return {
         "source_path": str(path),
         "page_count": len(pages),
-        "text": "\n\n".join(page["text"] for page in pages if page["text"]).strip(),
+        "text": text,
         "pages": pages,
+        "vaccination_sections": vaccination_sections,
+        "grid_debug": grid_debug,
     }
 
 
 def _build_vaccination_reader(layout_artifact: dict[str, Any]) -> dict[str, Any]:
-    vaccines: list[dict[str, Any]] = []
-    for page in layout_artifact.get("pages", []):
-        for section in page.get("vaccine_sections", []):
-            doses: list[dict[str, Any]] = []
-            for dose_column in section.get("dose_columns", []):
-                exact_blocks: list[dict[str, Any]] = []
-                ambiguous_blocks: list[dict[str, Any]] = []
-                for detail_line in section.get("detail_lines", []):
-                    for block in detail_line.get("blocks", []):
-                        if block.get("assigned_dose_number") != dose_column.get("dose_number"):
-                            continue
-                        payload = {
-                            "text": block.get("text"),
-                            "assignment_mode": block.get("assignment_mode"),
-                            "candidate_doses": block.get("candidate_doses", []),
-                        }
-                        if block.get("assignment_mode") == "exact":
-                            exact_blocks.append(payload)
-                        else:
-                            ambiguous_blocks.append(payload)
-
-                doses.append(
-                    {
-                        "dose_number": dose_column.get("dose_number"),
-                        "date": dose_column.get("date"),
-                        "header_text": dose_column.get("header_text"),
-                        "confidence": _reader_confidence_from_blocks(exact_blocks + ambiguous_blocks),
-                        "exact_detail_texts": [block["text"] for block in exact_blocks],
-                        "ambiguous_detail_blocks": ambiguous_blocks,
-                    }
-                )
-
-            doses.sort(key=_dose_sort_key)
-            vaccines.append(
-                {
-                    "page_number": page.get("page_number"),
-                    "vaccine_label": section.get("vaccine_label"),
-                    "header_line_text": section.get("header_line_text"),
-                    "header_continuation_lines": section.get("header_continuation_lines", []),
-                    "label_continuation_lines": section.get("label_continuation_lines", []),
-                    "doses": doses,
-                }
-            )
-
+    """Costruisce l'output tecnico del reader vaccinale."""
     return {
+        "reader_name": "vaccination_row_column_stage1",
+        "reader_version": "stage1_v1",
         "source_path": layout_artifact.get("source_path"),
         "page_count": layout_artifact.get("page_count"),
-        "vaccines": vaccines,
+        "grid_model": layout_artifact.get("grid_debug", {}),
+        "vaccines": layout_artifact.get("vaccination_sections", []),
     }
 
 
 def _render_reader_text(reader: dict[str, Any]) -> str:
+    """Rende una vista testuale leggibile dell'output tecnico del reader."""
     lines: list[str] = [
         "Vaccination certificate reader output.",
         "This is not the final clinical JSON.",
@@ -683,6 +806,11 @@ def _render_reader_text(reader: dict[str, Any]) -> str:
         lines.append("")
         lines.append(f"VACCINE: {vaccine.get('vaccine_label')}")
         lines.append(f"HEADER: {vaccine.get('header_line_text')}")
+        raw_lines = vaccine.get("vaccine_label_raw_lines", [])
+        if raw_lines:
+            lines.append("LABEL_RAW_LINES:")
+            for raw_line in raw_lines:
+                lines.append(f"- {raw_line}")
         continuation_lines = vaccine.get("header_continuation_lines", [])
         if continuation_lines:
             lines.append("HEADER_CONTINUATIONS:")
@@ -693,18 +821,23 @@ def _render_reader_text(reader: dict[str, Any]) -> str:
             lines.append("LABEL_CONTINUATIONS:")
             for continuation_line in label_continuation_lines:
                 lines.append(f"- {continuation_line}")
+        lines.append(
+            "FLAGS: "
+            f"name_wrapped={vaccine.get('name_wrapped')} "
+            f"dose_wrapped={vaccine.get('dose_wrapped')} "
+            f"page_wrapped={vaccine.get('page_wrapped')} "
+            f"label_needs_review={vaccine.get('label_needs_review')}"
+        )
         for dose in vaccine.get("doses", []):
             lines.append(
-                f"DOSE {dose.get('dose_number')} | DATE {dose.get('date')} | CONFIDENCE {dose.get('confidence')}"
+                "DOSE "
+                f"{dose.get('dose_number')} | DATE {dose.get('date')} | SOURCE {dose.get('source_kind')} | "
+                f"PAGE {dose.get('source_page_number')} | CONFIDENCE {dose.get('confidence')}"
             )
             exact_texts = dose.get("exact_detail_texts", [])
-            if exact_texts:
-                lines.append("EXACT_DETAILS:")
-                for dose_text in exact_texts:
-                    lines.append(f"- {dose_text}")
-            else:
-                lines.append("EXACT_DETAILS: none")
-
+            lines.append("EXACT_DETAILS:" if exact_texts else "EXACT_DETAILS: none")
+            for dose_text in exact_texts:
+                lines.append(f"- {dose_text}")
             ambiguous_blocks = dose.get("ambiguous_detail_blocks", [])
             if ambiguous_blocks:
                 lines.append("AMBIGUOUS_DETAILS:")
@@ -720,106 +853,59 @@ def _render_reader_text(reader: dict[str, Any]) -> str:
                 lines.append("AMBIGUOUS_DETAILS: none")
     return "\n".join(lines).strip() + "\n"
 
-def phase1_extract_text(pdf_path: Path) -> dict[str, Any]:
-    extraction = extract_text_from_pdf(pdf_path)
-    return {
-        "text": extraction.text,
-        "page_count": extraction.page_count,
-        "character_count": extraction.character_count,
-    }
+
+# ---------------------------------------------------------------------------
+# Metadata documento e paziente
+# ---------------------------------------------------------------------------
 
 
-def phase2_classify_document(pdf_path: Path, extracted_text: dict[str, Any]) -> dict[str, Any]:
-    family = classify_document_family(pdf_path)
-    text_lower = extracted_text["text"].lower()
-    tags: list[str] = []
-    matched_keywords: list[str] = []
-    document_subcategory: str | None = None
-
-    keyword_groups = { #TODO sistemare meglio le keyword in base al tipo di documento che si analizza
-        "laboratory_report": ["laboratorio", "referto specialistico", "synlab"],
-        "blood_test": ["emocromo", "globuli bianchi", "formula leucocitaria", "wbc"],
-        "infectious_screening": ["hiv", "hbsag", "anti-core virus b"],
-        #"covid_test": ["sars-cov-2", "tampone", "covid"],
-        "electronic_prescription": ["ricetta elettronica", "prescrizione"],
-        "vaccination_record": ["vaccin", "poliomielite", "morbillo"],
-        "summary_index": ["fascicolo sanitario", "data pubblicazione"],
-    }
-
-    for tag, keywords in keyword_groups.items():
-        found = [keyword for keyword in keywords if keyword in text_lower]
-        if found:
-            tags.append(tag)
-            matched_keywords.extend(found)
-
-    if family == DocumentFamily.VACCINATION_CERTIFICATE:
-        document_subcategory = "vaccination_certificate"
-    elif family == DocumentFamily.PRESCRIPTION:
-        document_subcategory = "electronic_prescription"
-    elif family == DocumentFamily.SUMMARY:
-        document_subcategory = "summary_index"
-    elif family == DocumentFamily.CLINICAL_DOCUMENT:
-        if "blood_test" in tags:
-            document_subcategory = "laboratory_blood_panel"
-        elif "covid_test" in tags:
-            document_subcategory = "covid_test_report"
-        elif "laboratory_report" in tags:
-            document_subcategory = "laboratory_report"
-
-    return {
-        "document_family": family,
-        "document_subcategory": document_subcategory,
-        "tags": _dedupe_preserve_order(tags),
-        "keyword_hits": _dedupe_preserve_order(matched_keywords),
-        "use_vaccination_parser": family == DocumentFamily.VACCINATION_CERTIFICATE,
-    }
+def _normalize_date(raw: str | None) -> str | None:
+    """Normalizza una data `dd/mm/yyyy` in `yyyy-mm-dd`."""
+    if not raw:
+        return None
+    parts = re.split(r"[/-]", raw)
+    if len(parts) != 3:
+        return raw
+    day, month, year = parts
+    if len(year) == 2:
+        year = f"20{year}" if int(year) <= 30 else f"19{year}"
+    return f"{year}-{month}-{day}"
 
 
-def _first_non_empty_match(patterns: list[re.Pattern[str]], text: str) -> str | None:
-    for pattern in patterns:
-        match = pattern.search(text)
-        if match:
-            value = " ".join(group for group in match.groups() if group).strip()
-            if value:
-                return re.sub(r"\s+", " ", value)
-    return None
+def _extract_filename_snapshot_date(pdf_path: Path) -> str | None:
+    """Estrae la data snapshot dal nome file del certificato."""
+    match = re.search(r"_(\d{8})(?:\d{6})?(?:_|\.pdf$)", pdf_path.name)
+    if not match:
+        return None
+    raw = match.group(1)
+    return f"{raw[0:4]}-{raw[4:6]}-{raw[6:8]}"
 
 
-def _extract_patient_name(text: str) -> dict[str, Any]:
-    full_name: str | None = None
-    patterns = [
-        re.compile(r"Nome\s+([A-ZÀ-ÖØ-Ý' ]+)\s+Cognome\s+([A-ZÀ-ÖØ-Ý' ]+)", re.IGNORECASE),
-        re.compile(r"COGNOME E NOME[^:]*:\s*([A-ZÀ-ÖØ-Ý' ]+)", re.IGNORECASE),
-    ]
-    first = _first_non_empty_match(patterns, text)
-    if first:
-        full_name = first
-    else:
-        for raw_line in text.splitlines():
-            line = raw_line.strip()
-            if not line or len(line.split()) < 2 or any(char.isdigit() for char in line):
-                continue
-            if UPPER_NAME_RE.match(line) and len(line.split()) <= 4:
-                full_name = re.sub(r"\s+", " ", line)
-                break
+def _normalize_street_prefix(address: str) -> str:
+    """Normalizza i prefissi stradali piu comuni."""
+    cleaned = _normalize_text(address).strip(" -")
+    if not cleaned:
+        return cleaned
+    parts = cleaned.split(" ", 1)
+    normalized_prefix = STREET_PREFIX_NORMALIZATION.get(parts[0].upper(), parts[0].upper())
+    return normalized_prefix if len(parts) == 1 else f"{normalized_prefix} {parts[1]}".strip()
 
-    given_name = None
-    family_name = None
-    if full_name:
-        parts = full_name.split()
-        if len(parts) >= 2:
-            family_name = parts[0]
-            given_name = " ".join(parts[1:])
 
-    return {
-        "full_name": full_name,
-        "given_name": given_name,
-        "family_name": family_name,
-    }
+def _dedupe_preserve_order(items: list[Any]) -> list[Any]:
+    """Rimuove i duplicati preservando l'ordine originale."""
+    seen: set[str] = set()
+    output: list[Any] = []
+    for item in items:
+        key = json.dumps(item, ensure_ascii=False, sort_keys=True) if isinstance(item, (dict, list)) else str(item)
+        if key not in seen:
+            seen.add(key)
+            output.append(item)
+    return output
 
 
 def _extract_vaccination_identity(text: str) -> dict[str, Any]:
-    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()]
+    """Estrae identita paziente e codice fiscale dal testo del certificato."""
+    lines = [_normalize_text(line) for line in text.splitlines() if _normalize_text(line)]
     full_name = None
     birth_place = None
     birth_date = None
@@ -834,7 +920,7 @@ def _extract_vaccination_identity(text: str) -> dict[str, Any]:
             identity_lines.append(line)
             name_match = re.search(r"(?:il|la)\s+sig\.?\s+(.+)$", line, re.IGNORECASE)
             if name_match:
-                full_name = re.sub(r"\s+", " ", name_match.group(1)).strip()
+                full_name = _normalize_text(name_match.group(1))
 
         if lower.startswith("nato a ") or lower.startswith("nata a "):
             identity_lines.append(line)
@@ -849,22 +935,18 @@ def _extract_vaccination_identity(text: str) -> dict[str, Any]:
                 tax_code = birth_match.group("tax_code").strip()
                 residence_city = birth_match.group("residence_city").strip()
                 address_suffix = (birth_match.group("address_suffix") or "").strip(" .")
-                street_address = None
-                if address_suffix:
-                    street_address = address_suffix
+                street_address = address_suffix or None
                 next_line = lines[index + 1] if index + 1 < len(lines) else ""
                 if next_line and not next_line.upper().startswith("HA EFFETTUATO") and not DOSE_DATE_RE.search(next_line):
                     identity_lines.append(next_line)
-                    if street_address:
-                        street_address = f"{street_address} {next_line}".strip()
-                    else:
-                        street_address = next_line
-                if street_address:
-                    street_address = _normalize_street_prefix(street_address)
-                    address_or_residence = street_address
-                else:
-                    address_or_residence = residence_city
+                    street_address = f"{street_address} {next_line}".strip() if street_address else next_line
+                address_or_residence = _normalize_street_prefix(street_address) if street_address else residence_city
             break
+
+    if not tax_code:
+        tax_code_match = TAX_CODE_RE.search(text)
+        if tax_code_match:
+            tax_code = tax_code_match.group(0)
 
     given_name = None
     family_name = None
@@ -887,7 +969,119 @@ def _extract_vaccination_identity(text: str) -> dict[str, Any]:
     }
 
 
+def _extract_typed_dates_for_vaccination(pdf_path: Path, patient_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Raccoglie le date tipizzate usate nel JSON finale."""
+    vaccination_dates: list[dict[str, Any]] = []
+    if patient_payload.get("birth_date"):
+        vaccination_dates.append(
+            {
+                "type": "birth_date",
+                "raw": patient_payload["birth_date"],
+                "normalized": patient_payload["birth_date"],
+                "source_line": "vaccination_identity_block",
+            }
+        )
+
+    snapshot_date = _extract_filename_snapshot_date(pdf_path)
+    if snapshot_date:
+        vaccination_dates.append(
+            {
+                "type": "document_snapshot_date",
+                "raw": pdf_path.stem,
+                "normalized": snapshot_date,
+                "source_line": pdf_path.name,
+                "meaning": "on this date the certificate attested the vaccinations listed in the document",
+            }
+        )
+    return vaccination_dates
+
+
+def _match_first(patterns: tuple[re.Pattern[str], ...], text: str) -> str | None:
+    """Restituisce il primo match significativo tra piu regex."""
+    for pattern in patterns:
+        match = pattern.search(text)
+        if match:
+            return _normalize_text(match.group(0).upper())
+    return None
+
+
+def _extract_issuer_metadata(layout_artifact: dict[str, Any]) -> dict[str, Any]:
+    """Estrae regione ed ente erogatore da header e footer del documento."""
+    observations: list[dict[str, Any]] = []
+    for page in layout_artifact.get("pages", []):
+        page_height = float(page.get("height") or 0.0)
+        for line in page.get("lines", []):
+            source = None
+            if float(line["top"]) <= 140.0:
+                source = "header"
+            elif float(line["bottom"]) >= page_height - 140.0:
+                source = "footer"
+            if source is None:
+                continue
+
+            normalized = _normalize_text(str(line["text"]).upper())
+            region = REGION_RE.search(normalized)
+            authority = _match_first(AUTHORITY_RES, normalized)
+            if region:
+                observations.append(
+                    {
+                        "source": source,
+                        "page": page["page_number"],
+                        "kind": "region",
+                        "text": normalized,
+                        "value": _normalize_text(region.group(0).upper()),
+                    }
+                )
+            if authority:
+                observations.append(
+                    {
+                        "source": source,
+                        "page": page["page_number"],
+                        "kind": "authority",
+                        "text": normalized,
+                        "value": authority,
+                    }
+                )
+
+    header_region = next((item["value"] for item in observations if item["source"] == "header" and item["kind"] == "region"), None)
+    footer_region = next((item["value"] for item in observations if item["source"] == "footer" and item["kind"] == "region"), None)
+    header_authority = next((item["value"] for item in observations if item["source"] == "header" and item["kind"] == "authority"), None)
+    footer_authority = next((item["value"] for item in observations if item["source"] == "footer" and item["kind"] == "authority"), None)
+
+    resolution_bits: list[str] = []
+    if header_region or header_authority:
+        resolution_bits.append("header")
+    if footer_region or footer_authority:
+        resolution_bits.append("footer")
+
+    return {
+        "issuer_region": header_region or footer_region,
+        "issuing_authority": header_authority or footer_authority,
+        "issuer_resolution_source": "+".join(resolution_bits) if resolution_bits else None,
+        "issuer_observations": _dedupe_preserve_order(observations),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Costruzione contenuto e output finale
+# ---------------------------------------------------------------------------
+
+
+def _clean_common_lines(text: str) -> list[str]:
+    """Pulisce le righe vuote e il rumore piu frequente."""
+    cleaned: list[str] = []
+    for raw_line in text.splitlines():
+        line = _normalize_text(raw_line)
+        if not line:
+            continue
+        if any(line.lower().startswith(prefix) for prefix in COMMON_NOISE_PREFIXES):
+            continue
+        cleaned.append(line)
+    return cleaned
+
+
 def _strip_vaccination_non_clinical_lines(lines: list[str]) -> list[str]:
+    """Rimuove le righe non cliniche dal testo pulito del certificato."""
     start_index = 0
     for index, line in enumerate(lines):
         if line.upper().startswith("HA EFFETTUATO LE SEGUENTI VACCINAZIONI"):
@@ -896,7 +1090,9 @@ def _strip_vaccination_non_clinical_lines(lines: list[str]) -> list[str]:
 
     filtered: list[str] = []
     for line in lines[start_index:]:
-        if line.startswith(FOOTER_PREFIXES):
+        if _is_vaccination_table_end_line(line):
+            break
+        if any(line.startswith(prefix) for prefix in FOOTER_PREFIXES):
             continue
         if line.startswith("SI CERTIFICA CHE"):
             continue
@@ -908,199 +1104,93 @@ def _strip_vaccination_non_clinical_lines(lines: list[str]) -> list[str]:
     return filtered
 
 
-def _extract_typed_dates(text: str) -> list[dict[str, Any]]:
-    typed_dates: list[dict[str, Any]] = []
-    for line in text.splitlines():
-        line_clean = line.strip()
-        if not line_clean:
-            continue
-        line_lower = line_clean.lower()
-        for raw_date in DATE_RE.findall(line_clean):
-            date_type = "unknown_document_date"
-            if "nato" in line_lower or "data di nascita" in line_lower:
-                date_type = "birth_date"
-            elif "pubblicazione" in line_lower:
-                date_type = "publication_date"
-            elif "validato" in line_lower or "firmato digitalmente" in line_lower:
-                date_type = "validation_date"
-            elif "tipo ricetta" in line_lower or "prescrizione" in line_lower or "data:" in line_lower:
-                date_type = "prescription_date"
-            elif "generato in data" in line_lower or "rilasciato" in line_lower:
-                date_type = "issue_date"
-            elif "codice lab" in line_lower or "prelievo" in line_lower:
-                date_type = "collection_date"
-            typed_dates.append(
-                {
-                    "type": date_type,
-                    "raw": raw_date,
-                    "normalized": _normalize_date(raw_date),
-                    "source_line": line_clean,
-                }
-            )
-    return _dedupe_preserve_order(typed_dates)
-
-
-def phase3_extract_base_metadata(
-    pdf_path: Path,
-    extracted_text: dict[str, Any],
-    classification: dict[str, Any],
-) -> dict[str, Any]:
-    text = extracted_text["text"]
-    tax_code_match = TAX_CODE_RE.search(text)
-    all_typed_dates = _extract_typed_dates(text)
-
-    if classification["use_vaccination_parser"]:
-        patient_payload = _extract_vaccination_identity(text)
-        snapshot_date = _extract_filename_snapshot_date(pdf_path)
-        vaccination_dates: list[dict[str, Any]] = []
-        if patient_payload.get("birth_date"):
-            vaccination_dates.append(
-                {
-                    "type": "birth_date",
-                    "raw": patient_payload["birth_date"],
-                    "normalized": patient_payload["birth_date"],
-                    "source_line": "vaccination_identity_block",
-                }
-            )
-        if snapshot_date:
-            vaccination_dates.append(
-                {
-                    "type": "document_snapshot_date",
-                    "raw": pdf_path.stem,
-                    "normalized": snapshot_date,
-                    "source_line": pdf_path.name,
-                    "meaning": "on this date the certificate attested the vaccinations listed in the document",
-                }
-            )
-    else:
-        patient_name = _extract_patient_name(text)
-        birth_date = None
-        for item in all_typed_dates:
-            if item["type"] == "birth_date":
-                birth_date = item["normalized"]
-                break
-
-        address_match = _first_non_empty_match(
-            [
-                re.compile(r"INDIRIZZO:\s*(.+)", re.IGNORECASE),
-                re.compile(r"Residenza[:\s]+(.+)", re.IGNORECASE),
-                re.compile(r"CITTA'[:\s]+(.+)", re.IGNORECASE),
-            ],
-            text,
-        )
-        raw_identity_lines = [
-            line.strip()
-            for line in text.splitlines()
-            if line.strip()
-            and (
-                "nome" in line.lower()
-                or "cognome" in line.lower()
-                or "codice fiscale" in line.lower()
-                or "nato" in line.lower()
-                or "indirizzo" in line.lower()
-            )
-        ]
-        patient_payload = {
-            **patient_name,
-            "tax_code": tax_code_match.group(0) if tax_code_match else None,
-            "birth_date": birth_date,
-            "birth_place": None,
-            "residence_city": None,
-            "address_or_residence": address_match,
-            "raw_identity_lines": _dedupe_preserve_order(raw_identity_lines),
-        }
-
-    issuing_org = _first_non_empty_match(
-        [
-            re.compile(r"(SYNLAB[^\n]*)", re.IGNORECASE),
-            re.compile(r"(REGIONE LOMBARDIA)", re.IGNORECASE),
-            re.compile(r"(ATS DI [A-Z?-??-?' ]+)", re.IGNORECASE),
-            re.compile(r"(PIATTAFORMA NAZIONALE DGC)", re.IGNORECASE),
-        ],
-        text,
-    )
-
-    if not patient_payload.get("tax_code") and tax_code_match:
-        patient_payload["tax_code"] = tax_code_match.group(0)
-
-    dates_payload = vaccination_dates if classification["use_vaccination_parser"] else all_typed_dates
-
+def phase1_extract_text(pdf_path: Path) -> dict[str, Any]:
+    """Esegue l'estrazione base del testo del PDF."""
+    extraction = extract_text_from_pdf(pdf_path)
     return {
-        "patient": patient_payload,
-        "dates": dates_payload,
-        "issuing_organization": issuing_org,
+        "text": extraction.text,
+        "page_count": extraction.page_count,
+        "character_count": extraction.character_count,
     }
 
 
-def _clean_common_lines(text: str) -> list[str]:
-    cleaned: list[str] = []
-    for raw_line in text.splitlines():
-        line = re.sub(r"\s+", " ", raw_line).strip()
-        if not line:
-            continue
-        if any(line.lower().startswith(prefix) for prefix in COMMON_NOISE_PREFIXES):
-            continue
-        cleaned.append(line)
-    return cleaned
+def phase2_classify_document(pdf_path: Path) -> dict[str, Any]:
+    """Classifica il documento e abilita il parser vaccinale anche per i file `vaccin*`."""
+    family = classify_document_family(pdf_path)
+    use_vaccination_parser = family == DocumentFamily.VACCINATION_CERTIFICATE or _looks_like_vaccination_pdf(pdf_path)
+    return {
+        "document_family": DocumentFamily.VACCINATION_CERTIFICATE if use_vaccination_parser else family,
+        "document_subcategory": "vaccination_document" if use_vaccination_parser else None,
+        "use_vaccination_parser": use_vaccination_parser,
+    }
 
 
-def phase4_interpret_document(
-    pdf_path: Path,
-    extracted_text: dict[str, Any],
-    classification: dict[str, Any],
-    metadata: dict[str, Any],
-    debug: bool = False,
-) -> dict[str, Any]:
-    cleaned_lines = _clean_common_lines(extracted_text["text"])
-    if classification["use_vaccination_parser"]:
-        cleaned_lines = _strip_vaccination_non_clinical_lines(cleaned_lines)
-    cleaned_text = "\n".join(cleaned_lines).strip()
-    interpretation: dict[str, Any] = {
+def phase3_extract_vaccination_metadata(pdf_path: Path, extracted_text: dict[str, Any], layout_artifact: dict[str, Any]) -> dict[str, Any]:
+    """Estrae metadata documento e identita paziente dal testo vaccinale."""
+    patient = _extract_vaccination_identity(extracted_text["text"])
+    dates = _extract_typed_dates_for_vaccination(pdf_path, patient)
+    issuer = _extract_issuer_metadata(layout_artifact)
+    return {
+        "patient": patient,
+        "dates": dates,
+        "document": {
+            "document_id": pdf_path.stem,
+            "source_path": str(pdf_path),
+            "document_snapshot_date": _extract_filename_snapshot_date(pdf_path),
+            "issuer_region": issuer.get("issuer_region"),
+            "issuing_authority": issuer.get("issuing_authority"),
+            "issuer_resolution_source": issuer.get("issuer_resolution_source"),
+            "issuer_observations": issuer.get("issuer_observations", []),
+        },
+    }
+
+
+def phase4_build_vaccination_interpretation(extracted_text: dict[str, Any], layout_artifact: dict[str, Any], reader: dict[str, Any]) -> dict[str, Any]:
+    """Costruisce il contenuto clinico pulito e gli artifact di debug."""
+    cleaned_lines = _strip_vaccination_non_clinical_lines(_clean_common_lines(extracted_text["text"]))
+    reader_text = _render_reader_text(reader)
+    return {
         "content": {
-            "cleaned_text": cleaned_text,
+            "cleaned_text": "\n".join(cleaned_lines).strip(),
             "relevant_lines": cleaned_lines[:80],
             "boilerplate_notes": [
                 "common_prefix_filter_applied",
-                "full raw text preserved in extracted_text.txt",
+                "vaccination_non_clinical_lines_removed",
             ],
         },
-        "specialized": {},
-        "debug_artifacts": {},
+        "specialized": {
+            "vaccination_reader": reader,
+        },
+        "debug_artifacts": {
+            "extracted_text": extracted_text["text"],
+            "interpreted_text": reader_text,
+            "layout_text": layout_artifact["text"],
+            "layout_words": layout_artifact,
+            "grid_debug": layout_artifact.get("grid_debug", {}),
+            "reader_text": reader_text,
+            "reader_json": reader,
+        },
     }
 
-    should_emit_debug = classification["use_vaccination_parser"] or debug
-    if classification["use_vaccination_parser"]:
-        layout_artifact = _extract_layout_artifact(pdf_path)
-        reader = _build_vaccination_reader(layout_artifact)
-        reader_text = _render_reader_text(reader)
-        interpretation["specialized"] = {
-            "vaccination_reader": reader,
-            "vaccination_reader_text": reader_text,
-        }
-        if should_emit_debug:
-            interpretation["debug_artifacts"] = {
-                "layout_text": layout_artifact["text"],
-                "layout_words": layout_artifact,
-                "reader_text": reader_text,
-                "reader_json": reader,
-            }
-
-    return interpretation
 
 def _render_interpreted_text(interpreted_json: dict[str, Any]) -> str:
+    """Rende una vista testuale del JSON interpretato finale."""
     lines: list[str] = []
     document = interpreted_json["document"]
     patient = interpreted_json["patient"]
-    classification = interpreted_json["classification"]
     content = interpreted_json["content"]
     dates = interpreted_json["dates"]
+    reader = interpreted_json.get("specialized", {}).get("vaccination_reader", {})
 
     lines.append("DOCUMENT")
+    lines.append(f"document_id: {document.get('document_id')}")
     lines.append(f"source_path: {document.get('source_path')}")
     lines.append(f"document_family: {document.get('document_family')}")
     lines.append(f"document_subcategory: {document.get('document_subcategory') or 'none'}")
-    lines.append(f"issuing_organization: {document.get('issuing_organization') or 'unknown'}")
     lines.append(f"document_snapshot_date: {document.get('document_snapshot_date') or 'unknown'}")
+    lines.append(f"issuer_region: {document.get('issuer_region') or 'unknown'}")
+    lines.append(f"issuing_authority: {document.get('issuing_authority') or 'unknown'}")
+    lines.append(f"issuer_resolution_source: {document.get('issuer_resolution_source') or 'unknown'}")
     lines.append("")
     lines.append("PATIENT")
     lines.append(f"full_name: {patient.get('full_name') or 'unknown'}")
@@ -1119,134 +1209,74 @@ def _render_interpreted_text(interpreted_json: dict[str, Any]) -> str:
     else:
         lines.append("- none")
     lines.append("")
-    lines.append("CLASSIFICATION")
-    lines.append(f"tags: {', '.join(classification.get('tags', [])) or 'none'}")
-    lines.append(f"keyword_hits: {', '.join(classification.get('keyword_hits', [])) or 'none'}")
-    lines.append("")
     lines.append("CONTENT")
     lines.append(content.get("cleaned_text") or "")
-
-    specialized = interpreted_json.get("specialized", {})
-    if specialized.get("vaccination_reader_text"):
+    if reader:
         lines.append("")
-        lines.append("SPECIALIZED")
-        lines.append(specialized["vaccination_reader_text"].strip())
+        lines.append(_render_reader_text(reader).strip())
     return "\n".join(lines).strip() + "\n"
 
 
-def _build_vaccination_prompt_from_interpreted_text(interpreted_text: str, source_document: Path) -> str:
-    return f"""
-You are given an interpreted stage1 output for one vaccination certificate.
-
-Source document: {source_document}
-
-Return one JSON object only.
-Use the interpreted stage1 output below as your source.
-Do not invent fields that are not supported by the interpreted text.
-
-Interpreted stage1 output:
-{interpreted_text}
-""".strip()
-
-
-def phase5_build_prompt_input(
-    pdf_path: Path,
-    classification: dict[str, Any],
-    metadata: dict[str, Any],
-    interpretation: dict[str, Any],
-) -> dict[str, Any]:
-    document_id = pdf_path.stem
+def phase5_build_output(pdf_path: Path, classification: dict[str, Any], metadata: dict[str, Any], interpretation: dict[str, Any]) -> dict[str, Any]:
+    """Combina metadata, classificazione e interpretazione nel JSON finale."""
     interpreted_json = {
         "document": {
-            "document_id": document_id,
-            "source_path": str(pdf_path),
+            **metadata["document"],
             "document_family": classification["document_family"].value,
             "document_subcategory": classification.get("document_subcategory"),
-            "issuing_organization": metadata.get("issuing_organization"),
-            "document_snapshot_date": _extract_filename_snapshot_date(pdf_path),
         },
         "patient": metadata["patient"],
         "dates": metadata["dates"],
         "classification": {
-            "tags": classification.get("tags", []),
-            "keyword_hits": classification.get("keyword_hits", []),
+            "tags": ["vaccination_record"],
+            "keyword_hits": ["vaccin"],
         },
         "content": interpretation["content"],
-        "specialized": interpretation.get("specialized", {}),
+        "specialized": interpretation["specialized"],
     }
-    interpreted_text = _render_interpreted_text(interpreted_json)
-
-    if classification["document_family"] == DocumentFamily.VACCINATION_CERTIFICATE:
-        prompt_main = _build_vaccination_prompt_from_interpreted_text(interpreted_text, pdf_path)
-    else:
-        prompt_main = build_document_prompt(classification["document_family"], interpreted_text)
-
     return {
-        "interpreted_text": interpreted_text,
         "interpreted_json": interpreted_json,
-        "prompt_main": prompt_main,
+        "interpreted_text": _render_interpreted_text(interpreted_json),
+        "debug_artifacts": interpretation.get("debug_artifacts", {}),
     }
 
 
-def _write_debug_artifacts(paths: dict[str, Path], interpretation: dict[str, Any]) -> None:
-    debug_artifacts = interpretation.get("debug_artifacts", {})
+def _write_debug_artifacts(paths: dict[str, Path], output: dict[str, Any]) -> None:
+    """Scrive gli artifact di debug opzionali di stage 1."""
+    debug_artifacts = output.get("debug_artifacts", {})
     if not debug_artifacts:
         return
-    if debug_artifacts.get("layout_text") is not None:
-        paths["layout_text"].write_text(debug_artifacts["layout_text"], encoding="utf-8")
-    if debug_artifacts.get("layout_words") is not None:
-        paths["layout_words"].write_text(
-            json.dumps(debug_artifacts["layout_words"], indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-    if debug_artifacts.get("reader_text") is not None:
-        paths["reader_text"].write_text(debug_artifacts["reader_text"], encoding="utf-8")
-    if debug_artifacts.get("reader_json") is not None:
-        paths["reader_json"].write_text(
-            json.dumps(debug_artifacts["reader_json"], indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+    paths["extracted_text"].write_text(debug_artifacts["extracted_text"], encoding="utf-8")
+    paths["interpreted_text"].write_text(output["interpreted_text"], encoding="utf-8")
+    paths["layout_text"].write_text(debug_artifacts["layout_text"], encoding="utf-8")
+    paths["layout_words"].write_text(json.dumps(debug_artifacts["layout_words"], indent=2, ensure_ascii=False), encoding="utf-8")
+    paths["grid_debug"].write_text(json.dumps(debug_artifacts.get("grid_debug", {}), indent=2, ensure_ascii=False), encoding="utf-8")
+    paths["reader_text"].write_text(debug_artifacts["reader_text"], encoding="utf-8")
+    paths["reader_json"].write_text(json.dumps(debug_artifacts["reader_json"], indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def _resolve_requested_pdfs(args: argparse.Namespace) -> tuple[list[Path], list[str]]:
-    raw_root = args.raw_root.resolve()
-    warnings: list[str] = []
-
-    # Comportamento di default: gira su tutte le persone e cerca automaticamente
-    # l'unico CertificatoVaccinale*.pdf per ciascuna cartella paziente.
-    if args.vaccini_all or not args.person:
-        if not raw_root.exists():
-            return [], [f"root documenti non trovata: {raw_root}"]
-        return _discover_vaccination_pdfs(raw_root)
-
-    person_dir = raw_root / args.person
-    if not person_dir.exists():
-        return [], [f"cartella paziente non trovata: {person_dir}"]
-    pdf_path = _find_unique_vaccination_pdf(person_dir)
-    if pdf_path is None:
-        matches = sorted(path.name for path in person_dir.glob(VACCINATION_GLOB) if path.is_file())
-        if not matches:
-            return [], [f"{args.person}: nessun {VACCINATION_GLOB} trovato"]
-        return [], [f"{args.person}: trovati piu certificati vaccinali: {', '.join(matches)}"]
-    return [pdf_path], warnings
+# ---------------------------------------------------------------------------
+# Orchestrazione stage
+# ---------------------------------------------------------------------------
 
 
 def _run_stage1_for_pdf(pdf_path: Path, args: argparse.Namespace) -> int:
+    """Esegue lo stage 1 vaccini su un singolo PDF."""
     document_root = _resolve_document_artifact_dir(pdf_path, args.artifacts_root.resolve())
     paths = _artifact_paths(document_root)
 
-    if not args.force and _has_stage1_outputs(document_root):
+    if not args.force and _has_stage1_output(document_root):
         print("=== STAGE 1 GIA PRONTO ===")
         print(f"-> Documento: {pdf_path.name}")
-        print(f"-> Artefatti esistenti: {paths['document_dir']}")
-        print("-> Salto l'estrazione per evitare passaggi inutili. Si puo passare direttamente alla fase dopo.")
+        print(f"-> Artifact JSON esistente: {paths['interpreted_json']}")
+        print("-> Salto l'estrazione per evitare passaggi inutili.")
         return 0
 
     paths["document_dir"].mkdir(parents=True, exist_ok=True)
 
-    print("=== AVVIO TEST STAGE 1 ===")
+    print("=== AVVIO STAGE 1 VACCINI ===")
     print(f"-> Documento: {pdf_path.name}")
-    print(f"-> Artefatti stage1: {paths['document_dir']}")
+    print(f"-> Artifact stage1: {paths['document_dir']}")
 
     print("\n[PHASE 1] Extract Text")
     extraction = phase1_extract_text(pdf_path)
@@ -1255,68 +1285,63 @@ def _run_stage1_for_pdf(pdf_path: Path, args: argparse.Namespace) -> int:
     if extraction["character_count"] == 0:
         print("ERRORE: il PDF non contiene testo estraibile.")
         return 1
-    paths["extracted_text"].write_text(extraction["text"], encoding="utf-8")
 
     print("\n[PHASE 2] Classify Document")
-    classification = phase2_classify_document(pdf_path, extraction)
+    classification = phase2_classify_document(pdf_path)
     print(f"-> Famiglia: {classification['document_family'].value}")
-    print(f"-> Sottocategoria: {classification.get('document_subcategory') or 'none'}")
-    print(f"-> Tag: {', '.join(classification.get('tags', [])) or 'none'}")
+    if not classification["use_vaccination_parser"]:
+        print("ERRORE: questo runner supporta solo documenti vaccinali.")
+        return 1
 
-    print("\n[PHASE 3] Extract Base Metadata")
-    metadata = phase3_extract_base_metadata(pdf_path, extraction, classification)
+    print("\n[PHASE 3] Parse Vaccination Layout + Metadata")
+    layout_artifact = _build_layout_artifact(pdf_path)
+    reader = _build_vaccination_reader(layout_artifact)
+    metadata = phase3_extract_vaccination_metadata(pdf_path, extraction, layout_artifact)
     print(f"-> Paziente: {metadata['patient'].get('full_name') or 'unknown'}")
     print(f"-> Codice fiscale: {metadata['patient'].get('tax_code') or 'unknown'}")
-    print(f"-> Date tipizzate trovate: {len(metadata.get('dates', []))}")
+    print(f"-> Voci vaccinali estratte: {len(reader.get('vaccines', []))}")
+    print(f"-> Ente documento: {metadata['document'].get('issuing_authority') or 'unknown'}")
 
-    print("\n[PHASE 4] Interpret Document")
-    interpretation = phase4_interpret_document(pdf_path, extraction, classification, metadata, debug=args.debug)
-    print("-> Interpretazione comune completata.")
-    if classification["use_vaccination_parser"]:
-        print("-> Parser vaccini dedicato attivato.")
-    elif args.debug:
-        print("-> Modalita debug attiva per artefatti aggiuntivi.")
+    print("\n[PHASE 4] Build Vaccination Interpretation")
+    interpretation = phase4_build_vaccination_interpretation(extraction, layout_artifact, reader)
+    print("-> JSON clinico vaccini costruito.")
 
-    print("\n[PHASE 5] Build Prompt Input")
-    prompt_input = phase5_build_prompt_input(pdf_path, classification, metadata, interpretation)
-    paths["interpreted_text"].write_text(prompt_input["interpreted_text"], encoding="utf-8")
-    paths["interpreted_json"].write_text(
-        json.dumps(prompt_input["interpreted_json"], indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    paths["prompt_main"].write_text(prompt_input["prompt_main"], encoding="utf-8")
-    _write_debug_artifacts(paths, interpretation)
+    print("\n[PHASE 5] Write Output")
+    output = phase5_build_output(pdf_path, classification, metadata, interpretation)
+    paths["interpreted_json"].write_text(json.dumps(output["interpreted_json"], indent=2, ensure_ascii=False), encoding="utf-8")
+    if args.debug_artifacts:
+        _write_debug_artifacts(paths, output)
 
-    print(f"-> Artefatto standard: {paths['extracted_text']}")
-    print(f"-> Artefatto standard: {paths['interpreted_text']}")
-    print(f"-> Artefatto standard: {paths['interpreted_json']}")
-    print(f"-> Artefatto standard: {paths['prompt_main']}")
-    if interpretation.get("debug_artifacts"):
-        print("-> Artefatti debug: layout_* e reader_* salvati per questo documento.")
+    print(f"-> Artifact standard: {paths['interpreted_json']}")
+    if args.debug_artifacts:
+        print("-> Artifact debug: extracted_text, interpreted_text, layout_*, reader_*")
+    else:
+        print("-> Nessun artifact debug scritto (usa --debug-artifacts per abilitarli).")
 
     print("\n=== STAGE 1 COMPLETATO ===")
-    print("-> Il prompt e pronto per stage2.")
-    print(f"-> Usa test_stage2.py con: {paths['prompt_main']}")
+    print("-> Parser vaccini pronto sugli artifact.")
     return 0
 
 
 def main() -> int:
+    """Entry point CLI di stage 1 vaccini."""
     args = _build_parser().parse_args()
     pdf_paths, warnings = _resolve_requested_pdfs(args)
 
     for warning in warnings:
         print(f"ATTENZIONE: {warning}")
-
     if not pdf_paths:
         print("ERRORE: nessun documento da processare.")
         return 1
 
-    exit_code = 0
+    if not args.person and not args.pdf:
+        print("-> Comportamento di default: scansione di tutti i pazienti sotto data/raw.")
+
+    exit_code = 1 if any(warning.startswith("ERRORE ") for warning in warnings) else 0
     for index, pdf_path in enumerate(pdf_paths, start=1):
         if len(pdf_paths) > 1:
             print(f"\n##### CERTIFICATO VACCINALE {index}/{len(pdf_paths)} #####")
             print(f"-> Persona: {pdf_path.parent.name}")
-            print("-> In modalita vaccini stage1 cerco automaticamente l'unico file che inizia con 'CertificatoVaccinale'.")
         if not pdf_path.exists():
             print(f"ERRORE: PDF non trovato in {pdf_path}")
             exit_code = 1

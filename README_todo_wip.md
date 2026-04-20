@@ -2,11 +2,24 @@
 
 source .venv/bin/activate
 
-- il parser va modificato perché deve accorgersi dei vaccini che scavallano la pagina
-- lo stage 5 dà problemi di visualizzazione perché prende le età e non le medie (ancora...)
-- meno file inutili salvati perché non me ne frega ninete
-- vaccini completamente certicalizzati? boh vorrei farli almeno incrociati
+- vedere che problemi ci sono adesso con il cazzo di parser
+- fare una cartella "utility" in data per standardizzare i nomi dei vaccini
+- sistema l'ordine crescente dei numeri nelle dosi, altrimenti saltano fuori cose strane
 
+- lo stage 5 dà problemi di visualizzazione perché prende le età e non le medie (ancora...)
+
+- vaccini completamente verticalizzati? boh vorrei farli almeno incrociati
+
+- valutare se fare direttamente l'estrazione da immagini per il parser (tanto prima o poi va fatto eh)
+- includere (concettualmente?) chi è entrato in Italia dopo
+
+- valutare un'aggregazione anche per tipologia di vaccino come mix (tipo la trivalente o la tetravalente)
+- vedere come distinguere i vaccini mix e le sessioni con vaccini multipli
+
+-vedere di rifare il sql per poter avere un migliore file xes e vedere se focalizzarci di più sulla questione delle "dosi vaccini", magari facendo un database di supporto a parte. in realtà uno dei punti è proprio l'aggregazione frammentata che si possono dare ai dati. in più: alcuni vaccini sono "normali" (tipo quelli alla nascita), mentre alcuni sono "extra" (tipo quello del covid)
+
+
+------------------------------------------
 
 Stato consolidato dell'ultimo giro:
 - stage1 vaccini gestisce meglio le righe spezzate delle dosi e usa `document_id = pdf_stem` come chiave stabile
